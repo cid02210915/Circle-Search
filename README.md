@@ -4,7 +4,9 @@
 
 ## Scientific motivation
 
-A Galactic mask removes part of each circle. Iterative inpainting fills the missing region, but the reconstructed temperatures depend on the random inpainting realisation. Reliable results therefore require many inpainted realisations for every CMB map, which makes the full search computationally expensive.
+A Galactic mask and foreground residuals can suppress the correlation of a genuine matched-circle pair, causing a topology signal to fall below the detection threshold and remain undetected.
+
+The main aim of this project is to test whether this occurs and to develop matched-circle detection methods that account for masking and foreground residuals.
 
 This repository investigates four connected approaches:
 
