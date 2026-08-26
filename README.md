@@ -29,10 +29,14 @@ For two circles of opening angle $\alpha$, the code evaluates
 S_{ij}(\alpha,\beta)
 =
 \frac{
-2\sum_m m\,\operatorname{Re}\!\left[C_{ij}(m)e^{-im\beta}\right]
+2\sum_m m\,\mathrm{Re}\left[
+C_{ij}(m)e^{-im\beta}
+\right]
 }{
-\sum_m m\left[C_{ii}(m)+C_{jj}(m)\right]
-},
+\sum_m m\left[
+C_{ii}(m)+C_{jj}(m)
+\right]
+}
 ```
 
 and maximises over the allowed circle centres $(i,j)$ and relative phase $\beta$. The lowest ring modes can be removed using `m_min`.
