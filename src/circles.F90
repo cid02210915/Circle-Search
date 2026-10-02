@@ -45,7 +45,7 @@ program circles
   end type tangle_range
 
   integer, parameter        :: MAX_THREAD_NUM=32
-  integer, parameter        :: D_DIFF_N_SEPARATIONS = 2
+  integer                   :: d_diff_max_separation = 2
 
   integer                   :: nside_map !512  !Healpix resolution of upgraded map
   integer                   :: nside_search
@@ -59,6 +59,7 @@ program circles
   logical                   :: use_d_diff_statistics = .false.
   logical                   :: write_d_diff_null_histogram = .false.
   logical                   :: use_d_diff_bias_correction = .false.
+  logical                   :: use_d_diff_q_statistics = .false.
   integer                   :: d_diff_hist_nbins = 2000
   integer                   :: d_diff_hist_n_joint
   integer                   :: d_diff_hist_bin_out
@@ -113,6 +114,13 @@ program circles
   integer,      allocatable :: d_diff_max_n_joint(:)
   integer,      allocatable :: d_diff_max_n_joint_result(:)
 
+  ! Gaussian null lookup for Q standardisation.
+  ! Indexed by (iopening_angle, N_joint).
+  real(dp), allocatable :: d_diff_gaussian_mu(:,:)
+  real(dp), allocatable :: d_diff_gaussian_sigma(:,:)
+  logical,  allocatable :: d_diff_gaussian_valid(:,:)
+  integer,  allocatable :: d_diff_gaussian_fit_method(:,:)
+
   integer,      allocatable :: opposite_list(:)           ! size: npix_search = 12*nside_search**2
   real,         allocatable :: circle_center_vectors(:,:) ! size: (3,npix_search)
 
@@ -123,7 +131,12 @@ program circles
 
   FFT_COMPLEX,  allocatable :: circle_transforms(:,:)     ! size: (nphi_ring/2+1, npix_search)
 
-  ! Third index is the real-space separation s = 1, 2.
+  ! Transforms for independent D search.
+  FFT_COMPLEX, allocatable :: d_w_t_transforms(:,:)
+  FFT_COMPLEX, allocatable :: d_w_transforms(:,:)
+  FFT_COMPLEX, allocatable :: d_w_t_sq_transforms(:,:)
+
+  ! Third index is the physical separation s.
   FFT_COMPLEX, allocatable :: d_diff_w_delta_t_transforms(:,:,:)
   FFT_COMPLEX, allocatable :: d_diff_w_transforms(:,:,:)
   FFT_COMPLEX, allocatable :: d_diff_w_delta_t_sq_transforms(:,:,:)
@@ -160,6 +173,26 @@ program circles
   type(tpair)               :: bestpair(MAX_THREAD_NUM)
   type(tcircle)             :: position_circle2
 
+  ! Thread-local results for the independent D search.
+  type(tcircle) :: d_best_circle1_thread(MAX_THREAD_NUM)
+  type(tcircle) :: d_best_circle2_thread(MAX_THREAD_NUM)
+
+  type(tcircle) :: d_best_circle1_local
+  type(tcircle) :: d_best_circle2_local
+
+  real(dp) :: d_max_thread(MAX_THREAD_NUM)
+  real(dp) :: d_best_local
+
+  integer :: d_beta_thread(MAX_THREAD_NUM)
+  integer :: d_n_joint_thread(MAX_THREAD_NUM)
+
+  integer :: d_beta_local
+  integer :: d_n_joint_local
+  integer :: d_best_thread
+
+  logical :: d_found_thread(MAX_THREAD_NUM)
+  logical :: d_found_local
+
   ! Thread-local results for the independent D_diff search.
   type(tcircle) :: d_diff_best_circle1_thread(MAX_THREAD_NUM)
   type(tcircle) :: d_diff_best_circle2_thread(MAX_THREAD_NUM)
@@ -182,6 +215,7 @@ program circles
 
   character(LEN=1000)       :: inifilename, outfilename, mapfilename, maskfilename
   character(LEN=1000)       :: d_filter_filename
+  character(LEN=1000)       :: d_diff_gaussian_lookup_filename
   character(LEN=1000)       :: position_smax_filename
   character(LEN=1000)       :: d_diff_null_hist_filename
   real(dp)                  :: smax_thread(MAX_THREAD_NUM)
@@ -253,10 +287,13 @@ program circles
   
      write(d_diff_null_hist_file, '(A)') &
           "# alpha_deg n_joint_diff d_diff_bin count"
-  
   end if
-  
+
   call fill_theta_rings(nside_search, theta_rings)
+
+  if (use_d_diff_q_statistics) then
+     call load_d_diff_gaussian_lookup()
+  end if
   
 #ifdef MPI
     open(unit=outfile, file=outfilename)
@@ -329,6 +366,16 @@ program circles
              & circle_transforms)
      end if
 
+     if (use_d_statistics .and. .not. use_s_statistics) then
+        call fill_d_transforms( &
+             & npix_search, circle1, nside_map, d_map, &
+             & use_pixel_average, nest2ring_table, &
+             & obs_mask, mask_threshold, &
+             & d_w_t_transforms, &
+             & d_w_transforms, &
+             & d_w_t_sq_transforms)
+     end if
+
      if (use_d_diff_statistics) then
         call fill_d_diff_transforms( &
              & npix_search, circle1, nside_map, d_map, &
@@ -348,6 +395,13 @@ program circles
      analysed_circles = 0
      d_diff_analysed_pairs = 0
      bestpair%smax = 0.
+
+     if (use_d_statistics .and. .not. use_s_statistics) then
+        d_max_thread = -huge(1.0_dp)
+        d_found_thread = .false.
+        d_beta_thread = 0
+        d_n_joint_thread = 0
+     end if
 
      if (use_d_diff_statistics) then
         d_diff_max_thread = -huge(1.0_dp)
@@ -370,6 +424,9 @@ program circles
      !$omp& opposite_list, opposite_vector, bestcircle1, bestcircle2, &
      !$omp& position_smax, position_circle2, position_beta_max_bin, &
      !$omp& position_dij, position_n_joint, &
+     !$omp& d_best_local, d_best_circle1_local, &
+     !$omp& d_best_circle2_local, d_beta_local, &
+     !$omp& d_n_joint_local, d_found_local, &
      !$omp& d_diff_best_local, d_diff_best_circle1_local, &
      !$omp& d_diff_best_circle2_local, d_diff_beta_local, &
      !$omp& d_diff_n_joint_local, d_diff_found_local) &
@@ -378,6 +435,10 @@ program circles
      !$omp& default(shared)
 
      smax = 0.
+     d_best_local = -huge(1.0_dp)
+     d_beta_local = 0
+     d_n_joint_local = 0
+     d_found_local = .false.
 
      d_diff_best_local = -huge(1.0_dp)
      d_diff_beta_local = 0
@@ -440,8 +501,19 @@ program circles
                    position_dij, &
                    position_n_joint
               !$omp end critical(position_smax_write)
-           end if
-           
+           end if  
+        end if
+
+        if (use_d_statistics .and. .not. use_s_statistics) then
+           call analyse_circle_pairs_d( &
+                & circle1, circle2, &
+                & opposite_list, opposite_number, &
+                & d_best_local, &
+                & d_best_circle1_local, &
+                & d_best_circle2_local, &
+                & d_beta_local, &
+                & d_n_joint_local, &
+                & d_found_local)
         end if
 
         if (opposite_number > 0) then
@@ -479,16 +551,31 @@ program circles
      end if
 
      if (use_s_statistics) then
-
         smax_thread(thread_id) = smax
         bestpair(thread_id)%smax = smax
         bestpair(thread_id)%circle1 = bestcircle1
         bestpair(thread_id)%circle2 = bestcircle2
+     end if
 
+     if (use_d_statistics .and. .not. use_s_statistics &
+         .and. d_found_local) then
+
+        d_max_thread(thread_id) = d_best_local
+
+        d_best_circle1_thread(thread_id) = &
+             & d_best_circle1_local
+
+        d_best_circle2_thread(thread_id) = &
+             & d_best_circle2_local
+
+        d_beta_thread(thread_id) = d_beta_local
+
+        d_n_joint_thread(thread_id) = d_n_joint_local
+
+        d_found_thread(thread_id) = .true.
      end if
 
      if (use_d_diff_statistics .and. d_diff_found_local) then
-
         d_diff_max_thread(thread_id) = d_diff_best_local
 
         d_diff_best_circle1_thread(thread_id) = &
@@ -504,12 +591,42 @@ program circles
              & d_diff_n_joint_local
 
         d_diff_found_thread(thread_id) = .true.
-
      end if
 
      deallocate(opposite_list)
      !$omp end parallel
      
+     if (use_d_statistics .and. .not. use_s_statistics) then
+
+        if (any(d_found_thread)) then
+           d_best_thread = maxloc( &
+                & d_max_thread, &
+                & dim=1, &
+                & mask=d_found_thread)
+
+           dmax_angle(iopening_angle) = &
+                & d_max_thread(d_best_thread)
+
+           dmax_circle1_pixel(iopening_angle) = &
+                & d_best_circle1_thread(d_best_thread)%pixel + 1
+
+           dmax_circle2_pixel(iopening_angle) = &
+                & d_best_circle2_thread(d_best_thread)%pixel + 1
+
+           dmax_beta_max_bin(iopening_angle) = &
+                & d_beta_thread(d_best_thread)
+
+           dmax_n_joint_max(iopening_angle) = &
+                & d_n_joint_thread(d_best_thread)
+        else
+           dmax_angle(iopening_angle) = 0.0_dp
+           dmax_circle1_pixel(iopening_angle) = 0
+           dmax_circle2_pixel(iopening_angle) = 0
+           dmax_beta_max_bin(iopening_angle) = 0
+           dmax_n_joint_max(iopening_angle) = 0
+        end if
+     end if
+
      if (use_d_diff_statistics .and. verbosity > 0) then
         write(*,*) &
              "D_diff examined ", d_diff_analysed_pairs, &
@@ -797,7 +914,6 @@ end if
                 & dmax_circle2_pixel_result(i), &
                 & dmax_beta_max_bin_result(i), &
                 & dmax_n_joint_max_result(i), nside_search)
-
         end do
 
         close(d_full_outfile)
@@ -811,10 +927,17 @@ end if
         d_diff_max_circle2_pixel_result = &
              & d_diff_max_circle2_pixel_result - 1
 
+     if (use_d_diff_q_statistics) then
+        open(unit=d_full_outfile, &
+             & file=trim(adjustl( &
+             & inifilename(1:len_trim(inifilename)-4))) // &
+             & "_q_diff.dat")
+     else
         open(unit=d_full_outfile, &
              & file=trim(adjustl( &
              & inifilename(1:len_trim(inifilename)-4))) // &
              & "_d_diff.dat")
+     end if
 
         do i = nside_search/2, 2*nside_search
 
@@ -942,6 +1065,18 @@ contains
        deallocate(circle_transforms)
     end if
 
+    if (allocated(d_w_t_transforms)) then
+       deallocate(d_w_t_transforms)
+    end if
+
+    if (allocated(d_w_transforms)) then
+       deallocate(d_w_transforms)
+    end if
+
+    if (allocated(d_w_t_sq_transforms)) then
+       deallocate(d_w_t_sq_transforms)
+    end if
+
     if (allocated(d_diff_w_delta_t_transforms)) then
        deallocate(d_diff_w_delta_t_transforms)
     end if
@@ -1019,6 +1154,22 @@ contains
        deallocate(d_diff_max_n_joint_result)
     end if
 
+    if (allocated(d_diff_gaussian_mu)) then
+       deallocate(d_diff_gaussian_mu)
+    end if
+    
+    if (allocated(d_diff_gaussian_sigma)) then
+       deallocate(d_diff_gaussian_sigma)
+    end if
+    
+    if (allocated(d_diff_gaussian_valid)) then
+       deallocate(d_diff_gaussian_valid)
+    end if
+    
+    if (allocated(d_diff_gaussian_fit_method)) then
+       deallocate(d_diff_gaussian_fit_method)
+    end if
+
     deallocate(nest2ring_table)
     deallocate(ring2nest_table)
     deallocate(theta_rings)
@@ -1049,8 +1200,14 @@ contains
     use_d_diff_statistics = ini_read_logical( &
          & "use_d_diff_statistics", .false.)
 
+    d_diff_max_separation = ini_read_int( &
+         & "d_diff_max_separation", 2)
+
     use_d_diff_bias_correction = ini_read_logical( &
          & "use_d_diff_bias_correction", .false.)
+
+    use_d_diff_q_statistics = ini_read_logical( &
+         & "use_d_diff_q_statistics", .false.)
 
     if (use_d_diff_bias_correction .and. &
         & .not. use_d_diff_statistics) then
@@ -1059,7 +1216,15 @@ contains
             "ERROR: use_d_diff_bias_correction requires ", &
             "use_d_diff_statistics = T"
        stop
+    end if
+
+    if (use_d_diff_q_statistics .and. &
+        & .not. use_d_diff_statistics) then
     
+       write(*,*) &
+            "ERROR: use_d_diff_q_statistics requires ", &
+            "use_d_diff_statistics = T"
+       stop
     end if
 
     write_d_diff_null_histogram = ini_read_logical( &
@@ -1082,13 +1247,9 @@ contains
        stop
     end if
 
-    if (use_d_statistics .and. .not. use_s_statistics) then
-       write(*,*) "ERROR: use_d_statistics requires use_s_statistics = T"
-       stop
-    end if
-
     maskfilename = ""
     d_filter_filename = ""
+    d_diff_gaussian_lookup_filename = ""
 
     if (use_d_statistics .or. use_d_diff_statistics) then
        maskfilename = ini_read_string("maskfilename")
@@ -1096,11 +1257,25 @@ contains
        d_filter_lmax = ini_read_int("d_filter_lmax", 300)
        mask_threshold = ini_read_real("mask_threshold", 0.5)
        d_min_joint_samples = ini_read_int("d_min_joint_samples")
+
+       if (use_d_diff_q_statistics) then
+          d_diff_gaussian_lookup_filename = ini_read_string( &
+               & "d_diff_gaussian_lookup_filename")
+       end if
     end if
 
     if (m_min < 1 .or. m_min > nphi_ring/2) then
        write(*,*) "ERROR: m_min must be between 1 and nphi_ring/2"
        stop
+    end if
+
+    if (use_d_diff_statistics) then
+       if (d_diff_max_separation < 1 .or. &
+           & d_diff_max_separation > nphi_ring/2) then
+          write(*,*) &
+               "ERROR: d_diff_max_separation must be between 1 and nphi_ring/2"
+          stop
+       end if
     end if
 
     if (use_d_statistics .or. use_d_diff_statistics) then
@@ -1212,21 +1387,32 @@ contains
             & 1:nphi_ring/2+1, 0:npix_search-1))
     end if
 
+    if (use_d_statistics .and. .not. use_s_statistics) then
+       allocate(d_w_t_transforms( &
+            & 1:nphi_ring/2+1, 0:npix_search-1))
+
+       allocate(d_w_transforms( &
+            & 1:nphi_ring/2+1, 0:npix_search-1))
+
+       allocate(d_w_t_sq_transforms( &
+            & 1:nphi_ring/2+1, 0:npix_search-1))
+    end if
+
     if (use_d_diff_statistics) then
        allocate(d_diff_w_delta_t_transforms( &
             & 1:nphi_ring/2+1, &
             & 0:npix_search-1, &
-            & 1:D_DIFF_N_SEPARATIONS))
-
+            & 1:d_diff_max_separation))
+    
        allocate(d_diff_w_transforms( &
             & 1:nphi_ring/2+1, &
             & 0:npix_search-1, &
-            & 1:D_DIFF_N_SEPARATIONS))
-
+            & 1:d_diff_max_separation))
+    
        allocate(d_diff_w_delta_t_sq_transforms( &
             & 1:nphi_ring/2+1, &
             & 0:npix_search-1, &
-            & 1:D_DIFF_N_SEPARATIONS))
+            & 1:d_diff_max_separation))
     end if
 
     if (write_d_diff_null_histogram) then
@@ -1450,7 +1636,6 @@ contains
             & real(ring_j(partner), dp)**2
   
        n_joint = n_joint + 1
-  
     end do
   
     if (n_joint < d_min_joint_samples .or. &
@@ -1461,8 +1646,158 @@ contains
   
     dvalue = numerator / denominator
     dvalue = max(-1.0_dp, min(1.0_dp, dvalue))
-  
   end subroutine get_d_at_beta
+
+  subroutine get_d_max(circle1, circle2, d_max, &
+       & beta_max_bin, n_joint_max)
+
+    implicit none
+
+    type(tcircle), intent(in)  :: circle1, circle2
+    real(dp),      intent(out) :: d_max
+    integer,       intent(out) :: beta_max_bin
+    integer,       intent(out) :: n_joint_max
+
+    integer :: nphi
+    integer :: beta_bin
+    integer :: beta_index
+    integer :: n_joint
+
+    real(dp) :: numerator
+    real(dp) :: denominator
+    real(dp) :: d_try
+
+    FFT_COMPLEX :: numerator_modes( &
+         & circle1%nphi_ring/2 + 1)
+
+    FFT_COMPLEX :: denominator_modes( &
+         & circle1%nphi_ring/2 + 1)
+
+    FFT_COMPLEX :: n_joint_modes( &
+         & circle1%nphi_ring/2 + 1)
+
+    real(FP) :: numerator_by_beta(circle1%nphi_ring)
+    real(FP) :: denominator_by_beta(circle1%nphi_ring)
+    real(FP) :: n_joint_by_beta(circle1%nphi_ring)
+
+    logical :: found_valid_beta
+
+    nphi = circle1%nphi_ring
+
+
+    ! ==================================================
+    ! Construct numerator, denominator and N_joint
+    ! for every beta at once.
+    ! ==================================================
+
+    if (orientable) then
+
+       ! partner = beta - k
+       ! Circular convolution.
+
+       numerator_modes = &
+            d_w_t_transforms(:,circle1%pixel) * &
+            d_w_t_transforms(:,circle2%pixel)
+
+       denominator_modes = &
+            d_w_t_sq_transforms(:,circle1%pixel) * &
+            d_w_transforms(:,circle2%pixel) + &
+            d_w_transforms(:,circle1%pixel) * &
+            d_w_t_sq_transforms(:,circle2%pixel)
+
+       n_joint_modes = &
+            d_w_transforms(:,circle1%pixel) * &
+            d_w_transforms(:,circle2%pixel)
+    else
+       ! partner = k + beta
+       ! Circular correlation.
+
+       numerator_modes = &
+            conjg(d_w_t_transforms(:,circle1%pixel)) * &
+            d_w_t_transforms(:,circle2%pixel)
+
+       denominator_modes = &
+            conjg(d_w_t_sq_transforms(:,circle1%pixel)) * &
+            d_w_transforms(:,circle2%pixel) + &
+            conjg(d_w_transforms(:,circle1%pixel)) * &
+            d_w_t_sq_transforms(:,circle2%pixel)
+
+       n_joint_modes = &
+            conjg(d_w_transforms(:,circle1%pixel)) * &
+            d_w_transforms(:,circle2%pixel)
+    end if
+
+#ifdef DFFT
+    call dfftw_execute_dft_c2r( &
+         & plan_backward, numerator_modes, &
+         & numerator_by_beta)
+
+    call dfftw_execute_dft_c2r( &
+         & plan_backward, denominator_modes, &
+         & denominator_by_beta)
+
+    call dfftw_execute_dft_c2r( &
+         & plan_backward, n_joint_modes, &
+         & n_joint_by_beta)
+#else
+    call sfftw_execute_dft_c2r( &
+         & plan_backward, numerator_modes, &
+         & numerator_by_beta)
+
+    call sfftw_execute_dft_c2r( &
+         & plan_backward, denominator_modes, &
+         & denominator_by_beta)
+
+    call sfftw_execute_dft_c2r( &
+         & plan_backward, n_joint_modes, &
+         & n_joint_by_beta)
+#endif
+    d_max = -huge(1.0_dp)
+    beta_max_bin = 0
+    n_joint_max = 0
+    found_valid_beta = .false.
+
+
+    do beta_bin = 0, nphi - 1
+
+       beta_index = beta_bin + 1
+
+       denominator = real( &
+            denominator_by_beta(beta_index), dp)
+
+       n_joint = nint( &
+            real(n_joint_by_beta(beta_index), dp) / &
+            dble(nphi))
+
+       n_joint = max(0, min(nphi, n_joint))
+
+       if (n_joint < d_min_joint_samples .or. &
+           denominator <= tiny(1.0_dp)) cycle
+
+       numerator = 2.0_dp * real( &
+            numerator_by_beta(beta_index), dp)
+
+       d_try = numerator / denominator
+       d_try = max(-1.0_dp, min(1.0_dp, d_try))
+
+       if (.not. found_valid_beta .or. &
+           d_try > d_max) then
+
+          d_max = d_try
+          beta_max_bin = beta_bin
+          n_joint_max = n_joint
+          found_valid_beta = .true.
+       end if
+
+    end do
+
+    if (.not. found_valid_beta) then
+       d_max = 0.0_dp
+       beta_max_bin = 0
+       n_joint_max = 0
+    end if
+
+  end subroutine get_d_max
 
   real(dp) function d_diff_bias_mean(alpha_deg, n_joint)
   
@@ -1514,6 +1849,7 @@ contains
     real(dp) :: numerator
     real(dp) :: denominator
     real(dp) :: d_diff_try
+    real(dp) :: score_try
 
     FFT_COMPLEX :: numerator_modes( &
          & circle1%nphi_ring/2 + 1)
@@ -1525,27 +1861,25 @@ contains
          & circle1%nphi_ring/2 + 1)
 
     real(FP) :: numerator_by_beta( &
-         & circle1%nphi_ring, D_DIFF_N_SEPARATIONS)
+         & circle1%nphi_ring, d_diff_max_separation)
 
     real(FP) :: denominator_by_beta( &
-         & circle1%nphi_ring, D_DIFF_N_SEPARATIONS)
+         & circle1%nphi_ring, d_diff_max_separation)
 
     real(FP) :: n_joint_by_beta( &
-         & circle1%nphi_ring, D_DIFF_N_SEPARATIONS)
+         & circle1%nphi_ring, d_diff_max_separation)
 
     logical :: found_valid_beta
 
     nphi = circle1%nphi_ring
 
-
     ! ==================================================
     ! Calculate numerator, denominator and N_joint
     ! for every beta and every separation.
     ! ==================================================
-    do separation_bin = 1, D_DIFF_N_SEPARATIONS
+    do separation_bin = 1, d_diff_max_separation
 
        if (orientable) then
-
           ! Circular convolution.
           numerator_modes = &
                d_diff_w_delta_t_transforms( &
@@ -1568,9 +1902,7 @@ contains
                :, circle1%pixel, separation_bin) * &
                d_diff_w_transforms( &
                :, circle2%pixel, separation_bin)
-
        else
-
           ! Circular correlation.
           numerator_modes = &
                conjg(d_diff_w_delta_t_transforms( &
@@ -1593,7 +1925,6 @@ contains
                :, circle1%pixel, separation_bin)) * &
                d_diff_w_transforms( &
                :, circle2%pixel, separation_bin)
-
        end if
 
 
@@ -1642,13 +1973,12 @@ contains
        denominator = 0.0_dp
 
        ! This will become the smallest N_joint among
-       ! the two separations.
+       ! all requested separations.
        n_joint = nphi
 
-       do separation_bin = 1, D_DIFF_N_SEPARATIONS
+       do separation_bin = 1, d_diff_max_separation
 
           if (orientable) then
-
              ! For separation s, the cached forward
              ! difference on circle j must be read at
              ! beta-s and multiplied by -1.
@@ -1683,47 +2013,334 @@ contains
           n_joint_separation = max( &
                0, min(nphi, n_joint_separation))
 
-          ! Require both separations to have adequate
+          ! Require all separations to have adequate
           ! jointly valid support.
           n_joint = min( &
                n_joint, n_joint_separation)
 
        end do
 
-
        if (n_joint < d_min_joint_samples .or. &
            & denominator <= tiny(1.0_dp)) cycle
 
        ! Raw numerator and denominator contributions
-       ! from separation 1 and separation 2 have already
+       ! from all requested separations have already
        ! been summed.
        d_diff_try = numerator / denominator
 
        d_diff_try = max( &
             -1.0_dp, min(1.0_dp, d_diff_try))
 
-       if (.not. found_valid_beta .or. &
-           & d_diff_try > d_diff_max) then
+       if (use_d_diff_q_statistics) then
+       
+          score_try = -log10( &
+               0.5_dp * erfc( &
+               (d_diff_try - &
+                d_diff_gaussian_mu(iopening_angle, n_joint)) / &
+               (sqrt(2.0_dp) * &
+                d_diff_gaussian_sigma(iopening_angle, n_joint)) &
+               ) &
+               )
+       else
+          score_try = d_diff_try
+       end if
 
-          d_diff_max = d_diff_try
+       if (.not. found_valid_beta .or. &
+           & score_try > d_diff_max) then
+          d_diff_max = score_try
           beta_max_bin = beta_bin
           n_joint_max = n_joint
           found_valid_beta = .true.
-
        end if
 
     end do
 
-
     if (.not. found_valid_beta) then
-
        d_diff_max = 0.0_dp
        beta_max_bin = 0
        n_joint_max = 0
-
     end if
 
   end subroutine get_d_diff_max
+
+  subroutine load_d_diff_gaussian_lookup()
+  
+    implicit none
+  
+    integer :: lookup_unit
+    integer :: ios
+  
+    integer :: alpha_index
+    integer :: n_joint
+    integer :: n_geometry
+    integer :: n_pooled_values
+    integer :: fit_valid
+    integer :: fit_method
+  
+    integer :: first_iopening_angle
+    integer :: n_active_alpha
+    integer :: iopening_lookup
+    integer :: ith
+    integer :: n
+  
+    real(dp) :: alpha_deg
+    real(dp) :: mu_value
+    real(dp) :: sigma_value
+    
+    character(len=1000) :: line
+  
+    ! ==================================================
+    ! This Gaussian table was calibrated specifically for:
+    !   nphi = 512
+    !   N_joint = 100,...,512
+    ! ==================================================
+  
+    if (nphi_ring /= 512) then
+       write(*,*) &
+            "ERROR: D_diff Gaussian lookup requires nphi_ring = 512"
+       stop
+    end if
+  
+    if (d_min_joint_samples < 100 .or. &
+        & d_min_joint_samples > 512) then
+       write(*,*) &
+            "ERROR: D_diff Gaussian lookup requires ", &
+            "100 <= d_min_joint_samples <= 512"
+       stop
+    end if
+
+    if (.not. orientable) then
+       write(*,*) &
+            "ERROR: D_diff Gaussian lookup requires orientable = T"
+       stop
+    end if
+    
+    if (d_diff_max_separation /= 2) then
+       write(*,*) &
+            "ERROR: D_diff Gaussian lookup requires ", &
+            "d_diff_max_separation = 2"
+       stop
+    end if
+    
+    ! ==================================================
+    ! Find the first active opening-angle grid point.
+    !
+    ! For the current 25--45 degree search this gives
+    ! 52 consecutive theta_rings.
+    !
+    ! Table alpha_index = 0 corresponds to the first one,
+    ! alpha_index = 1 to the next one, etc.
+    ! ==================================================
+  
+    first_iopening_angle = -1
+    n_active_alpha = 0
+  
+    do ith = nside_search/2, 2*nside_search
+  
+       if ( &
+            rad_to_deg(dble(theta_rings(ith))) >= &
+            dble(opening_angle_range%min) .and. &
+            rad_to_deg(dble(theta_rings(ith))) <= &
+            dble(opening_angle_range%max) &
+          ) then
+  
+          if (first_iopening_angle < 0) then
+             first_iopening_angle = ith
+          end if
+  
+          n_active_alpha = n_active_alpha + 1
+       end if
+  
+    end do
+  
+    if (n_active_alpha /= 52) then
+       write(*,*) &
+            "ERROR: Gaussian lookup contains 52 alpha values, ", &
+            "but current search contains ", n_active_alpha
+       stop
+    end if
+  
+    ! ==================================================
+    ! Allocate lookup:
+    !
+    ! first index  = iopening_angle
+    ! second index = N_joint
+    ! ==================================================
+  
+    allocate( &
+         d_diff_gaussian_mu( &
+         nside_search/2:2*nside_search, &
+         0:nphi_ring) &
+    )
+  
+    allocate( &
+         d_diff_gaussian_sigma( &
+         nside_search/2:2*nside_search, &
+         0:nphi_ring) &
+    )
+  
+    d_diff_gaussian_mu = 0.0_dp
+    d_diff_gaussian_sigma = -1.0_dp
+  
+    ! ==================================================
+    ! Open lookup table.
+    ! Same basic I/O pattern as read_d_filter().
+    ! ==================================================
+  
+    open( &
+         newunit=lookup_unit, &
+         file=trim(adjustl( &
+         d_diff_gaussian_lookup_filename)), &
+         status="old", &
+         action="read", &
+         iostat=ios &
+    )
+  
+    if (ios /= 0) then
+       write(*,*) &
+            "ERROR: could not open D_diff Gaussian lookup:"
+       write(*,*) &
+            trim(adjustl( &
+            d_diff_gaussian_lookup_filename))
+       stop
+    end if
+  
+    ! ==================================================
+    ! File columns:
+    !
+    ! 1 alpha_index
+    ! 2 alpha_deg
+    ! 3 N_joint
+    ! 4 mu
+    ! 5 sigma
+    ! 6 n_geometry
+    ! 7 n_pooled_values
+    ! 8 fit_valid
+    ! 9 fit_method
+    ! ==================================================
+    do
+       read(lookup_unit, "(A)", iostat=ios) line
+  
+       ! End of file.
+       if (ios < 0) exit
+  
+       if (ios > 0) then
+          write(*,*) &
+               "ERROR while reading D_diff Gaussian lookup"
+          stop
+       end if
+  
+       line = adjustl(line)
+  
+       ! Ignore blank/comment lines.
+       if (len_trim(line) == 0) cycle
+       if (line(1:1) == "#") cycle
+  
+       read( &
+            line, *, iostat=ios &
+       ) &
+            alpha_index, &
+            alpha_deg, &
+            n_joint, &
+            mu_value, &
+            sigma_value, &
+            n_geometry, &
+            n_pooled_values, &
+            fit_valid, &
+            fit_method
+  
+       if (ios /= 0) then
+          write(*,*) &
+               "ERROR: invalid row in D_diff Gaussian lookup:"
+          write(*,*) trim(line)
+          stop
+       end if
+  
+       ! Table has alpha_index = 0,...,51.
+       if (alpha_index < 0 .or. &
+           alpha_index >= n_active_alpha) then
+          write(*,*) &
+               "ERROR: invalid alpha_index in Gaussian lookup: ", &
+               alpha_index
+          stop
+       end if
+  
+       if (n_joint < 100 .or. &
+           n_joint > nphi_ring) then
+          write(*,*) &
+               "ERROR: invalid N_joint in Gaussian lookup: ", &
+               n_joint
+          stop
+       end if
+  
+       if (fit_valid /= 1) then
+          write(*,*) &
+               "ERROR: invalid Gaussian lookup cell: ", &
+               alpha_index, n_joint
+          stop
+       end if
+  
+       if (sigma_value <= 0.0_dp) then
+          write(*,*) &
+               "ERROR: non-positive sigma in Gaussian lookup: ", &
+               alpha_index, n_joint, sigma_value
+          stop
+       end if
+  
+       ! Direct mapping:
+       !
+       ! alpha_index=0  -> first active theta_ring
+       ! alpha_index=1  -> next theta_ring
+       ! ...
+       ! alpha_index=51 -> last active theta_ring
+       iopening_lookup = &
+            first_iopening_angle + alpha_index
+  
+       d_diff_gaussian_mu( &
+            iopening_lookup, n_joint) = &
+            mu_value
+  
+       d_diff_gaussian_sigma( &
+            iopening_lookup, n_joint) = &
+            sigma_value
+    end do
+  
+    close(lookup_unit)
+  
+    ! ==================================================
+    ! Final completeness check.
+    !
+    ! Every active alpha must have mu/sigma for
+    ! every N_joint = 100,...,512.
+    ! ==================================================
+  
+    do ith = first_iopening_angle, &
+         first_iopening_angle + n_active_alpha - 1
+  
+       do n = 100, nphi_ring
+          if (d_diff_gaussian_sigma(ith,n) <= 0.0_dp) then
+  
+             write(*,*) &
+                  "ERROR: missing Gaussian lookup cell:"
+             write(*,*) &
+                  "iopening_angle = ", ith, &
+                  " N_joint = ", n
+             stop
+          end if
+       end do
+  
+    end do
+  
+    if (verbosity > 0) then
+       write(*,*) &
+            "Loaded complete D_diff Gaussian lookup"
+  
+       write(*,*) &
+            "alpha cells = ", n_active_alpha, &
+            ", N_joint = 100...", nphi_ring
+    end if
+  
+  end subroutine load_d_diff_gaussian_lookup
 
   subroutine initialize_nest2ring_table(nside, npix, nest2ring_table)
     implicit none
@@ -1939,6 +2556,127 @@ contains
 
   end subroutine fill_circle_transforms
 
+  subroutine fill_d_transforms( &
+       & npix, circle, nside_map, map, pixel_average, &
+       & nest2ring_table, obs_mask, mask_threshold, &
+       & w_t_transforms, w_transforms, w_t_sq_transforms)
+
+    implicit none
+
+    integer,       intent(in)    :: npix
+    type(tcircle), intent(inout) :: circle
+    integer,       intent(in)    :: nside_map
+    real(sp),      intent(in)    :: map(0:)
+    logical,       intent(in)    :: pixel_average
+    integer,       intent(in)    :: nest2ring_table(0:)
+    real(sp),      intent(in)    :: obs_mask(0:)
+    real(dp),      intent(in)    :: mask_threshold
+
+    FFT_COMPLEX, intent(out) :: w_t_transforms(1:,0:)
+    FFT_COMPLEX, intent(out) :: w_transforms(1:,0:)
+    FFT_COMPLEX, intent(out) :: w_t_sq_transforms(1:,0:)
+
+    integer :: i
+    integer :: iphi
+    integer :: nphi
+
+    real(FP) :: ring(circle%nphi_ring)
+    real(FP) :: w_t(circle%nphi_ring)
+    real(FP) :: w(circle%nphi_ring)
+    real(FP) :: w_t_sq(circle%nphi_ring)
+
+    FFT_COMPLEX :: modes(circle%nphi_ring/2 + 1)
+
+    logical :: valid(circle%nphi_ring)
+
+    nphi = circle%nphi_ring
+
+
+    !$omp parallel private( &
+    !$omp& i, iphi, ring, w_t, w, w_t_sq, modes, valid) &
+    !$omp& firstprivate(circle)
+
+    !$omp do schedule(dynamic)
+    do i = 0, npix - 1
+
+       circle%pixel = i
+       circle%theta = pix2ang_table(i)%theta
+       circle%phi   = pix2ang_table(i)%phi
+
+       call get_temperature_along_circle( &
+            & circle, nside_map, map, pixel_average, &
+            & nest2ring_table, ring, obs_mask, &
+            & mask_threshold, valid)
+
+
+#ifdef DFFT
+       call dfftw_execute_dft_r2c( &
+            & plan_forward, ring, modes)
+#else
+       call sfftw_execute_dft_r2c( &
+            & plan_forward, ring, modes)
+#endif
+
+       modes(1:m_min) = 0.0
+
+#ifdef DFFT
+       call dfftw_execute_dft_c2r( &
+            & plan_backward, modes, ring)
+#else
+       call sfftw_execute_dft_c2r( &
+            & plan_backward, modes, ring)
+#endif
+
+       ring = ring / dble(nphi)
+
+
+       w      = 0.0
+       w_t    = 0.0
+       w_t_sq = 0.0
+
+       do iphi = 1, nphi
+
+          if (.not. valid(iphi)) cycle
+
+          w(iphi)      = 1.0
+          w_t(iphi)    = ring(iphi)
+          w_t_sq(iphi) = ring(iphi)**2
+
+       end do
+
+
+#ifdef DFFT
+       call dfftw_execute_dft_r2c( &
+            & plan_forward, w_t, &
+            & w_t_transforms(:,i))
+
+       call dfftw_execute_dft_r2c( &
+            & plan_forward, w, &
+            & w_transforms(:,i))
+
+       call dfftw_execute_dft_r2c( &
+            & plan_forward, w_t_sq, &
+            & w_t_sq_transforms(:,i))
+#else
+       call sfftw_execute_dft_r2c( &
+            & plan_forward, w_t, &
+            & w_t_transforms(:,i))
+
+       call sfftw_execute_dft_r2c( &
+            & plan_forward, w, &
+            & w_transforms(:,i))
+
+       call sfftw_execute_dft_r2c( &
+            & plan_forward, w_t_sq, &
+            & w_t_sq_transforms(:,i))
+#endif
+
+    end do
+    !$omp end do
+    !$omp end parallel
+
+  end subroutine fill_d_transforms
+
   subroutine fill_d_diff_transforms( &
        & npix, circle, nside_map, map, pixel_average, &
        & nest2ring_table, obs_mask, mask_threshold, &
@@ -2019,9 +2757,9 @@ contains
        ring = ring / dble(nphi)
 
        ! Construct the required quantities separately for
-       ! real-space separations s = 1 and s = 2.
-       do separation_bin = 1, D_DIFF_N_SEPARATIONS
-       
+       ! real-space separations s = 1,...,d_diff_max_separation.
+       do separation_bin = 1, d_diff_max_separation
+
           w = 0.0
           w_delta_t = 0.0
           w_delta_t_sq = 0.0
@@ -2439,10 +3177,70 @@ contains
           bestcircle1 = circle1
           bestcircle2 = circle2
        end if
-
     end do
 
   end subroutine analyse_circle_pairs
+
+  subroutine analyse_circle_pairs_d( &
+       & circle1, circle2, opposite_list, opposite_number, &
+       & d_best_at_alpha, &
+       & best_circle1_at_alpha, best_circle2_at_alpha, &
+       & best_beta_at_alpha, best_n_joint_at_alpha, &
+       & found_pair_at_alpha)
+
+    implicit none
+
+    type(tcircle), intent(in)    :: circle1
+    type(tcircle), intent(inout) :: circle2
+
+    integer, intent(in) :: opposite_list(0:)
+    integer, intent(in) :: opposite_number
+
+    real(dp), intent(inout) :: d_best_at_alpha
+
+    type(tcircle), intent(inout) :: best_circle1_at_alpha
+    type(tcircle), intent(inout) :: best_circle2_at_alpha
+
+    integer, intent(inout) :: best_beta_at_alpha
+    integer, intent(inout) :: best_n_joint_at_alpha
+
+    logical, intent(inout) :: found_pair_at_alpha
+
+    integer :: j
+    integer :: beta_try
+    integer :: n_joint_try
+
+    real(dp) :: d_try
+
+    do j = 0, opposite_number - 1
+
+       circle2%pixel = opposite_list(j)
+
+       ! Avoid evaluating both (i,j) and (j,i).
+       if (circle2%pixel < circle1%pixel) cycle
+
+       call get_d_max( &
+            & circle1, circle2, d_try, &
+            & beta_try, n_joint_try)
+
+       if (n_joint_try < d_min_joint_samples) cycle
+
+       if (.not. found_pair_at_alpha .or. &
+           d_try > d_best_at_alpha) then
+
+          d_best_at_alpha = d_try
+
+          best_circle1_at_alpha = circle1
+          best_circle2_at_alpha = circle2
+
+          best_beta_at_alpha = beta_try
+          best_n_joint_at_alpha = n_joint_try
+
+          found_pair_at_alpha = .true.
+       end if
+    end do
+
+  end subroutine analyse_circle_pairs_d
 
   subroutine analyse_circle_pairs_d_diff( &
        & circle1, circle2, opposite_list, opposite_number, &
