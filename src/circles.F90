@@ -1624,7 +1624,7 @@ contains
        if (orientable) then
           partner = modulo(beta_bin - (iphi - 1), nphi) + 1
        else
-          partner = modulo((iphi - 1) + beta_bin, nphi) + 1
+          partner = modulo((iphi - 1) - beta_bin, nphi) + 1
        end if
   
        if (.not. (valid_i(iphi) .and. valid_j(partner))) cycle
