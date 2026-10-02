@@ -112,6 +112,202 @@ D^{\mathrm{diff}}(\beta)
 \right]
 }.
 ```
+## Background: conditional Q statistic
+
+### Why raw D-diff needs conditioning
+
+In a masked circle search, the number of jointly valid samples changes from one trial to another. In particular, it can change with circle radius, circle pair, and phase shift.
+
+Therefore two trials with the same raw D-diff value do not necessarily have the same statistical significance. The null distribution of D-diff depends on the amount of valid data available.
+
+The aim of the conditional statistic is therefore to compare each observed D-diff value only with an appropriate null distribution.
+
+For the feasible blind search, we approximate
+
+```math
+P\left(
+D^{\mathrm{diff}}
+\mid
+i,j,\alpha,\beta
+\right)
+\;\longrightarrow\;
+P\left(
+D^{\mathrm{diff}}
+\mid
+\alpha,N_{\mathrm{joint}}
+\right).
+```
+
+Thus candidates with different values of N-joint are compared using different null distributions.
+
+---
+
+### Empirical conditional significance
+
+Suppose an observed trial has value
+
+```math
+D_{\mathrm{obs}}^{\mathrm{diff}}.
+```
+
+For null samples with the same circle radius and comparable N-joint, define the number of exceedances
+
+```math
+R_{\mathrm{null}}
+=
+\#\left\{
+D_{\mathrm{null}}^{\mathrm{diff}}
+\ge
+D_{\mathrm{obs}}^{\mathrm{diff}}
+\right\}.
+```
+
+If there are M conditional null samples, the empirical survival probability is
+
+```math
+p_{\mathrm{emp}}
+=
+\frac{R_{\mathrm{null}}+1}{M+1}.
+```
+
+The corresponding empirical significance is
+
+```math
+Q_{\mathrm{emp}}
+=
+-\log_{10}
+\left(
+p_{\mathrm{emp}}
+\right).
+```
+
+A larger Q therefore means that the observed D-diff value is more unusual relative to its matching null distribution.
+
+---
+
+### Why the empirical Q cannot be used directly for maximisation
+
+The empirical survival probability has a finite resolution.
+
+If an observed value lies beyond every available null sample, then
+
+```math
+R_{\mathrm{null}}=0,
+```
+
+and therefore
+
+```math
+Q_{\mathrm{emp,max}}
+=
+\log_{10}(M+1).
+```
+
+For example, with 1500 null samples,
+
+```math
+Q_{\mathrm{emp,max}}
+\approx
+\log_{10}(1501)
+\approx
+3.18.
+```
+
+This creates a saturation problem: several different extreme D-diff values can all receive exactly the same empirical Q.
+
+That is particularly problematic in a blind search, where Q is maximised over many phase shifts. Once several phases reach the empirical ceiling, their relative ordering is lost.
+
+---
+
+### Continuous Gaussian survival probability
+
+To remove this discrete ceiling, the conditional null distribution is fitted with a continuous Gaussian model,
+
+```math
+D^{\mathrm{diff}}
+\mid
+(\alpha,N_{\mathrm{joint}})
+\sim
+\mathcal{N}
+\left(
+\mu(\alpha,N_{\mathrm{joint}}),
+\sigma^2(\alpha,N_{\mathrm{joint}})
+\right).
+```
+
+For a measured value D-diff, define
+
+```math
+z
+=
+\frac{
+D^{\mathrm{diff}}
+-
+\mu(\alpha,N_{\mathrm{joint}})
+}{
+\sigma(\alpha,N_{\mathrm{joint}})
+}.
+```
+
+The fitted upper-tail survival probability is
+
+```math
+p_{\mathrm{surv}}
+=
+1-\Phi(z),
+```
+
+or equivalently,
+
+```math
+p_{\mathrm{surv}}
+=
+\frac{1}{2}
+\operatorname{erfc}
+\left(
+\frac{z}{\sqrt{2}}
+\right).
+```
+
+The conditional Q statistic used in the blind search is then
+
+```math
+Q
+=
+-\log_{10}
+\left(
+p_{\mathrm{surv}}
+\right).
+```
+
+Unlike the empirical estimate, this fitted survival probability remains continuous beyond the largest sampled null value, so extreme candidates can still be ranked.
+
+---
+
+### Q evaluation in the blind search
+
+For every tested circle pair and phase:
+
+1. Compute the raw D-diff value.
+2. Compute its corresponding N-joint.
+3. Use the lookup table at the matching circle radius and N-joint to obtain the Gaussian mean and standard deviation.
+4. Convert the raw D-diff value to its upper-tail survival probability.
+5. Convert the survival probability to Q.
+6. Maximise Q over the tested phase shifts and circle pairs.
+
+In short,
+
+```math
+D^{\mathrm{diff}}
+\;\longrightarrow\;
+(\alpha,N_{\mathrm{joint}})
+\;\longrightarrow\;
+p_{\mathrm{surv}}
+\;\longrightarrow\;
+Q.
+```
+
+This makes the blind competition depend on how unusual each candidate is relative to its appropriate null distribution, rather than on the raw D-diff amplitude alone.
 
 # Circle-Search
 
