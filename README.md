@@ -1,91 +1,111 @@
 ## Main changes in this branch
 
-### 1. Conditional Gaussian standardisation of \(D^{\mathrm{diff}}\)
+### 1. Conditional Gaussian standardisation of $D^{\mathrm{diff}}$
 
 The original search maximised the raw statistic
 
-\[
+$$
 D^{\mathrm{diff}}(\beta).
-\]
+$$
 
-The new pipeline can instead use a conditional Gaussian null model,
+The new pipeline can instead compare each value with its conditional Gaussian null distribution,
 
-\[
+$$
 D^{\mathrm{diff}}
 \mid
-\left(\alpha,N_{\mathrm{joint}}\right)
+(\alpha, N_{\mathrm{joint}})
 \sim
 \mathcal{N}
-\left[
+\left(
 \mu(\alpha,N_{\mathrm{joint}}),
 \sigma^2(\alpha,N_{\mathrm{joint}})
-\right].
-\]
+\right).
+$$
 
 For each trial,
 
-\[
+$$
 p
 =
-P
-\left(
+P\left(
 D_{\mathrm{null}}^{\mathrm{diff}}
 \ge
 D^{\mathrm{diff}}
 \mid
 \alpha,N_{\mathrm{joint}}
 \right),
-\]
+$$
 
-and the search statistic is
+and
 
-\[
-Q
-=
--\log_{10}p.
-\]
+$$
+Q=-\log_{10}p.
+$$
 
-This allows trials with different \(N_{\mathrm{joint}}\) to be compared on the
-same null-calibrated scale. The original raw-\(D^{\mathrm{diff}}\) search is
-still available. 
+The search can maximise $Q$ instead of raw $D^{\mathrm{diff}}$, allowing trials with different $N_{\mathrm{joint}}$ to be compared on the same null-calibrated scale.
 
-### 2. Independent \(D\) search
+---
 
-Previously, \(D\) was mainly evaluated at a phase selected by another
-statistic, for example
+### 2. Independent $D$ search
 
-\[
+Previously, $D$ was mainly evaluated at the phase selected by $S$,
+
+$$
 D(\beta_S),
-\]
+$$
 
-where \(\beta_S\) is the phase that maximises \(S\).
+where
 
-The new pipeline also supports a fully independent \(D\) search,
+$$
+\beta_S=\operatorname*{arg\,max}_{\beta} S(\beta).
+$$
 
-\[
+The new pipeline also allows $D$ to select its own preferred circle pair and phase,
+
+$$
 D_{\max}
 =
-\max_{i,j,\beta}
-D_{ij}(\beta),
-\]
+\max_{i,j,\beta} D_{ij}(\beta).
+$$
 
-so the best circle pair and phase are selected directly using \(D\) itself.
+---
 
-### 3. Configurable separation range in \(D^{\mathrm{diff}}\)
+### 3. Configurable separation range in $D^{\mathrm{diff}}$
 
-The old implementation fixed
+The old implementation used only
 
-\[
+$$
 s=1,2.
-\]
+$$
 
-The new pipeline introduces
+The new implementation allows
 
-\[
+$$
 s=1,2,\ldots,s_{\max},
-\]
+$$
 
-where \(s_{\max}\) is set through
+with `d_diff_max_separation` controlling $s_{\max}$.
+
+The combined statistic is
+
+$$
+D^{\mathrm{diff}}(\beta)
+=
+\frac{
+2\sum_{s=1}^{s_{\max}}
+\sum_{\phi}
+\Delta T_i^{(s)}(\phi)
+\Delta T_j^{(s)}(\phi,\beta)
+}{
+\sum_{s=1}^{s_{\max}}
+\sum_{\phi}
+\left[
+\left(\Delta T_i^{(s)}(\phi)\right)^2
++
+\left(\Delta T_j^{(s)}(\phi,\beta)\right)^2
+\right]
+}.
+$$
 
 
 # Circle-Search
