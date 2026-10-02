@@ -98,6 +98,21 @@ program circles
   real(dp), allocatable :: master_auto_f_reg(:)
   real(dp), allocatable :: master_auto_denominator(:)
   logical, allocatable :: master_auto_valid(:)
+  real(FP), allocatable :: master_auto_modes(:,:)
+  
+  integer(8) :: psd_fail_modes
+  integer(8) :: expected_psd_modes
+  real(dp) :: psd_fail_fraction
+  integer, parameter :: n_rho_bins = 2000
+  
+  real(dp), parameter :: rho_min = -1.0_dp
+  real(dp), parameter :: rho_max =  1.0_dp
+  real(dp), parameter :: rho_bin_width = &
+       (rho_max - rho_min) / real(n_rho_bins, dp)
+  
+  integer(8) :: rho_hist_thread(n_rho_bins, MAX_THREAD_NUM)
+  integer(8) :: rho_hist(n_rho_bins)
+  integer(8) :: rho_hist_result(n_rho_bins)
 
   integer(8)                :: plan_forward
   integer(8)                :: plan_backward
@@ -107,6 +122,7 @@ program circles
   real(dp)                  :: selected_f_reg_ij
   real(dp)                  :: selected_f_reg_ii
   real(dp)                  :: selected_f_reg_jj
+  real(dp)                  :: selected_f_lost
   real(dp)                  :: position_smax
   real(dp)                  :: opposite_vector(3)
   integer                   :: opposite_number
@@ -114,14 +130,28 @@ program circles
   integer                   :: outfile = 101
   integer                   :: full_outfile = 110
   integer                   :: position_smax_file = 202
+  integer                   :: rho_hist_file = 203
   logical                   :: orientable=.false.
   logical                   :: write_every_nth_smax=.false.
   logical                   :: write_position_smax=.false.
   integer                   :: every_nth_smax = 10000, every_nth_smax_file = 201
   logical                   :: scramble_sky = .false.
   logical                   :: use_sw_filter = .false.
+  logical                   :: use_gcv_regularisation = .true.
+  logical                   :: use_flost_regularisation = .false.
+  real(dp)                  :: rho_tolerance = 1.0_dp
+  logical                   :: write_rho_hist = .false.
+  logical                   :: write_f_lost = .false.
   character(LEN=1000)       :: sw_filter_filename
   integer                   :: sw_filter_lmax = 300
+
+  real(dp), parameter :: &
+       & flost_A = 0.08912509381337459_dp
+
+  integer, parameter :: n_flost_support = 5
+  real(dp), parameter :: &
+       & flost_support(n_flost_support) = (/ &
+       & 0.05_dp, 0.15_dp, 0.25_dp, 0.35_dp, 0.45_dp /)
 
   type(tangle_range)        :: opening_angle_range
   type(tcircle)             :: circle1, circle2, bestcircle1, bestcircle2
@@ -131,12 +161,14 @@ program circles
   character(LEN=1000)       :: inifilename, outfilename, mapfilename
   character(LEN=1000)       :: maskfilename
   character(LEN=1000)       :: position_smax_filename
+  character(LEN=1000)       :: rho_hist_filename
   real(dp)                  :: smax_thread(MAX_THREAD_NUM)
   real(dp)                  :: min_separation_angle
   logical                   :: random_s = .false.
   integer                   :: thread_id, beta_max_bin
   logical                   :: final_valid_pair
   integer                   :: position_beta_max_bin
+  integer(8)                :: position_psd_fail_modes
   integer                   :: MPIid=0
   integer                   :: MPIsize=1
 
@@ -189,9 +221,11 @@ program circles
   smax_circle1_pixel = 0
   smax_circle2_pixel = 0
   smax_beta_max_bin = 0
+  rho_hist_thread = 0_8
+  rho_hist = 0_8
+  rho_hist_result = 0_8
 
   do iopening_angle = nside_search/2 + mpiid, 2*nside_search, mpisize
-
      circle1%opening_angle = theta_rings(iopening_angle)
 
      if ((rad_to_deg(circle1%opening_angle) .lt. opening_angle_range%min) .or. &
@@ -234,6 +268,7 @@ program circles
           & mask_transforms, &
           & master_auto_f_reg, &
           & master_auto_denominator, &
+          & master_auto_modes, &
           & master_auto_valid)
 
 #ifdef MPI
@@ -243,6 +278,7 @@ program circles
 #endif
      smax_thread = 0.
      analysed_circles = 0
+     psd_fail_modes = 0_8
      bestpair%smax = 0.
 
      if (write_every_nth_smax) then
@@ -257,9 +293,10 @@ program circles
 #endif
      !$omp parallel private(i, smax, thread_id, opposite_number, &
      !$omp& opposite_list, opposite_vector, bestcircle1, bestcircle2, &
-     !$omp& position_smax, position_circle2, position_beta_max_bin) &
+     !$omp& position_smax, position_circle2, position_beta_max_bin, &
+     !$omp& position_psd_fail_modes) &
      !$omp& firstprivate(circle1, circle2) &
-     !$omp& reduction(+:analysed_circles) &
+     !$omp& reduction(+:analysed_circles, psd_fail_modes) &
      !$omp& default(shared)
 
      smax = 0.
@@ -290,7 +327,11 @@ program circles
              & smax, bestcircle1, bestcircle2, &
              & position_smax, position_circle2, &
              & position_beta_max_bin, analysed_circles, &
-             & every_nth_smax_file)
+             & every_nth_smax_file, &
+             & position_psd_fail_modes)
+
+        psd_fail_modes = &
+             psd_fail_modes + position_psd_fail_modes
 
         if (write_position_smax .and. &
             & position_beta_max_bin >= 0) then
@@ -328,13 +369,32 @@ program circles
 
      deallocate(opposite_list)
      !$omp end parallel
-     
+
+     expected_psd_modes = &
+          int(analysed_circles, kind=8) * &
+          int(nphi_ring/2 - m_min + 1, kind=8)
+
+     if (psd_fail_modes > expected_psd_modes) then
+        write(*,*) "ERROR: PSD failure count exceeds total checked modes."
+        stop
+     end if
+
+     if (expected_psd_modes > 0_8) then
+        psd_fail_fraction = &
+             dble(psd_fail_modes) / &
+             dble(expected_psd_modes)
+     else
+        psd_fail_fraction = 0.0_dp
+     end if
+
 #ifdef MPI
      stoptime = mpi_wtime()
 #else
      call cpu_time(stoptime)
 #endif
 
+     write(*,*) &
+          "PSD fail_fraction =", psd_fail_fraction
      if (write_every_nth_smax) close(every_nth_smax_file)
 
      smax_angle(iopening_angle) = maxval(smax_thread)
@@ -354,7 +414,8 @@ program circles
           & smax, beta_max_bin, final_valid_pair, &
           & selected_f_reg_ij, &
           & selected_f_reg_ii, &
-          & selected_f_reg_jj)
+          & selected_f_reg_jj, &
+          & selected_f_lost)
 
      if (.not. final_valid_pair) then
         write(*,*) "ERROR: selected MASTER pair is invalid."
@@ -364,11 +425,21 @@ program circles
      smax_beta_max_bin(iopening_angle) = beta_max_bin
 
 #ifdef MPI
-     write(outfile,*) rad_to_deg(circle1%opening_angle), &
-          & smax_angle(iopening_angle), &
-          & selected_f_reg_ij, &
-          & selected_f_reg_ii, &
-          & selected_f_reg_jj
+     if (write_f_lost) then
+        write(outfile,*) rad_to_deg(circle1%opening_angle), &
+             & smax_angle(iopening_angle), &
+             & selected_f_reg_ij, &
+             & selected_f_reg_ii, &
+             & selected_f_reg_jj, &
+             & selected_f_lost
+     else
+        write(outfile,*) rad_to_deg(circle1%opening_angle), &
+             & smax_angle(iopening_angle), &
+             & selected_f_reg_ij, &
+             & selected_f_reg_ii, &
+             & selected_f_reg_jj
+     end if
+     
      call flush(outfile)
 #endif
 
@@ -386,10 +457,13 @@ program circles
 #endif
         write(*,*) rad_to_deg(circle1%opening_angle), &
              & smax_angle(iopening_angle), mpiid
-
      end if
-
   end do
+
+  if (write_rho_hist) then
+     rho_hist = &
+          sum(rho_hist_thread, dim=2)
+  end if
 
 ! Gather the maxima from all MPI ranks.
 #ifdef MPI
@@ -414,6 +488,12 @@ program circles
        & size(smax_beta_max_bin), MPI_integer, MPI_sum, 0, &
        & MPI_COMM_WORLD, ierr)
 
+  if (write_rho_hist) then
+     call MPI_reduce( &
+          & rho_hist, rho_hist_result, n_rho_bins, &
+          & MPI_INTEGER8, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+  end if
+
   if (mpiid .eq. 0) then
 
      smax_circle1_pixel_result = smax_circle1_pixel_result - 1
@@ -437,6 +517,30 @@ program circles
        end do
      close(full_outfile)
 
+     if (write_rho_hist) then
+        rho_hist_filename = &
+             trim(adjustl( &
+             inifilename(1:len_trim(inifilename)-4))) // &
+             "_rho_hist.dat"
+        open( &
+             unit=rho_hist_file, &
+             file=trim(rho_hist_filename))
+
+        write(rho_hist_file,'(A)') &
+             "# rho_low rho_high rho_center count"
+
+        do i = 1, n_rho_bins
+           write(rho_hist_file,*) &
+                rho_min + &
+                dble(i - 1) * rho_bin_width, &
+                rho_min + &
+                dble(i) * rho_bin_width, &
+                rho_min + &
+                (dble(i) - 0.5_dp) * rho_bin_width, &
+                rho_hist_result(i)
+        end do
+        close(rho_hist_file)
+     end if
   end if
 #endif
 
@@ -532,6 +636,10 @@ contains
     if (allocated(master_auto_valid)) then
        deallocate(master_auto_valid)
     end if
+
+    if (allocated(master_auto_modes)) then
+       deallocate(master_auto_modes)
+    end if
     
     if (allocated(sw_filtered_map)) then
        deallocate(sw_filtered_map)
@@ -577,12 +685,42 @@ contains
     write_every_nth_smax=ini_read_logical("write_every_nth_smax", .false.)
     every_nth_smax=ini_read_int("every_nth_smax", 10000)
     write_position_smax=ini_read_logical("write_position_smax", .false.)
+    write_f_lost = ini_read_logical("write_f_lost", .false.)
     random_s = ini_read_logical("random_s", .false.)
     scramble_sky = ini_read_logical("scramble_sky", .false.)
 
     use_sw_filter = ini_read_logical( &
          & "use_sw_filter", .false.)
+
+    use_gcv_regularisation = ini_read_logical( &
+         & "use_gcv_regularisation", .true.)    
+
+    use_flost_regularisation = ini_read_logical( &
+         & "use_flost_regularisation", .false.)
     
+    rho_tolerance = ini_read_real( &
+         & "rho_tolerance", 1.0)
+    
+    write_rho_hist = ini_read_logical( &
+         & "write_rho_hist", .false.)
+    
+    if (rho_tolerance < 0.0_dp .or. &
+        & rho_tolerance > 1.0_dp) then
+    
+       write(*,*) &
+            "ERROR: rho_tolerance must be between 0 and 1."
+       stop
+    
+    end if
+
+    if (use_gcv_regularisation .and. &
+        & use_flost_regularisation) then
+    
+       write(*,*) &
+            "ERROR: GCV and f_lost regularisation cannot both be enabled."
+       stop
+    end if
+
     if (use_sw_filter) then
        sw_filter_filename = ini_read_string( &
             & "sw_filter_filename")
@@ -648,6 +786,8 @@ contains
     allocate(master_auto_f_reg(0:npix_search-1))
     allocate(master_auto_denominator(0:npix_search-1))
     allocate(master_auto_valid(0:npix_search-1))
+    allocate(master_auto_modes( &
+     & 0:nphi_ring/2, 0:npix_search-1))
 
     master_auto_f_reg = 0.0_dp
     master_auto_denominator = 0.0_dp
@@ -810,7 +950,8 @@ contains
 
   subroutine get_f_lost_by_beta( &
        & circle1, circle2, mask_transforms, &
-       & f_lost_by_beta, has_eligible_beta)
+       & f_lost_by_beta, has_eligible_beta, &
+       & joint_modes)
 
     implicit none
 
@@ -828,40 +969,41 @@ contains
     integer :: beta_bin
     integer :: n_joint
 
-    FFT_COMPLEX :: &
+    FFT_COMPLEX, intent(out) :: &
          & joint_modes(circle1%nphi_ring/2 + 1)
 
     real(FP) :: &
          & joint_by_beta(circle1%nphi_ring)
 
+    FFT_COMPLEX :: &
+         & joint_modes_work(circle1%nphi_ring/2 + 1)
+
     nphi = circle1%nphi_ring
 
     ! Fourier product of the two binary mask rings.
     if (orientable) then
-
        ! Matching convention:
        ! partner = beta - k
        joint_modes = &
             mask_transforms(:,circle1%pixel) * &
             mask_transforms(:,circle2%pixel)
-
     else
-
        ! Matching convention:
        ! partner = k + beta
        joint_modes = &
             mask_transforms(:,circle1%pixel) * &
             conjg(mask_transforms(:,circle2%pixel))
-
     end if
+
+    joint_modes_work = joint_modes
 
     ! Recover N_joint(beta) for every beta.
 #ifdef DFFT
     call dfftw_execute_dft_c2r( &
-         & plan_backward, joint_modes, joint_by_beta)
+         & plan_backward, joint_modes_work, joint_by_beta)
 #else
     call sfftw_execute_dft_c2r( &
-         & plan_backward, joint_modes, joint_by_beta)
+         & plan_backward, joint_modes_work, joint_by_beta)
 #endif
 
     do beta_bin = 0, nphi - 1
@@ -916,139 +1058,6 @@ contains
             conjg(r2c_modes(m + 1))
     end do
   end subroutine expand_r2c_spectrum
-
-  subroutine build_master_pair_inputs( &
-       & circle1, circle2, &
-       & masked_circle_transforms, &
-       & mask_transforms, &
-       & C_hat_ij, C_hat_ii, C_hat_jj, &
-       & M_column_ij, M_column_ii, M_column_jj)
-
-    implicit none
-
-    type(tcircle), intent(in) :: circle1
-    type(tcircle), intent(in) :: circle2
-
-    ! Unnormalised FFTs of the masked-temperature rings:
-    ! FFT[w_i T_i] and FFT[w_j T_j].
-    FFT_COMPLEX, intent(in) :: &
-         & masked_circle_transforms(1:,0:)
-
-    ! Normalised window coefficients:
-    ! W_m = FFT[w]_m / Nphi.
-    FFT_COMPLEX, intent(in) :: &
-         & mask_transforms(1:,0:)
-
-    ! Directly measured masked pseudo-mode products.
-    FFT_COMPLEX, intent(out) :: &
-         & C_hat_ij(circle1%nphi_ring)
-
-    FFT_COMPLEX, intent(out) :: &
-         & C_hat_ii(circle1%nphi_ring)
-
-    FFT_COMPLEX, intent(out) :: &
-         & C_hat_jj(circle1%nphi_ring)
-
-    ! First columns of the three coupling matrices.
-    FFT_COMPLEX, intent(out) :: &
-         & M_column_ij(circle1%nphi_ring)
-
-    FFT_COMPLEX, intent(out) :: &
-         & M_column_ii(circle1%nphi_ring)
-
-    FFT_COMPLEX, intent(out) :: &
-         & M_column_jj(circle1%nphi_ring)
-
-    integer :: nphi
-
-    ! Complete cyclic mode arrays:
-    ! m = 0, ..., Nphi - 1.
-    FFT_COMPLEX :: &
-         & masked_modes_i(circle1%nphi_ring)
-
-    FFT_COMPLEX :: &
-         & masked_modes_j(circle1%nphi_ring)
-
-    FFT_COMPLEX :: &
-         & window_modes_i(circle1%nphi_ring)
-
-    FFT_COMPLEX :: &
-         & window_modes_j(circle1%nphi_ring)
-
-    nphi = circle1%nphi_ring
-
-    ! Masked-temperature modes for circle i.
-    call expand_r2c_spectrum( &
-         & masked_circle_transforms(:,circle1%pixel), &
-         & nphi, masked_modes_i)
-
-    ! Masked-temperature modes for circle j.
-    call expand_r2c_spectrum( &
-         & masked_circle_transforms(:,circle2%pixel), &
-         & nphi, masked_modes_j)
-
-    ! Window modes for circle i.
-    call expand_r2c_spectrum( &
-         & mask_transforms(:,circle1%pixel), &
-         & nphi, window_modes_i)
-
-    ! Window modes for circle j.
-    call expand_r2c_spectrum( &
-         & mask_transforms(:,circle2%pixel), &
-         & nphi, window_modes_j)
-
-    ! Masked auto pseudo-mode products:
-    !
-    ! C_hat_ii(m) = |T_hat_i(m)|^2
-    ! C_hat_jj(m) = |T_hat_j(m)|^2
-    C_hat_ii = &
-         masked_modes_i * conjg(masked_modes_i)
-
-    C_hat_jj = &
-         masked_modes_j * conjg(masked_modes_j)
-
-    ! First columns of the auto-coupling matrices:
-    !
-    ! M_ii(m,0) = |W_i(m)|^2
-    ! M_jj(m,0) = |W_j(m)|^2
-    M_column_ii = &
-         window_modes_i * conjg(window_modes_i)
-
-    M_column_jj = &
-         window_modes_j * conjg(window_modes_j)
-
-    if (orientable) then
-
-       ! Reversed-orientation pseudo cross-product:
-       !
-       ! C_hat_ij(m) =
-       ! T_hat_i(m) T_hat_j(m)
-       C_hat_ij = &
-            masked_modes_i * masked_modes_j
-
-       ! First column:
-       !
-       ! M_ij(m,0) = W_i(m) W_j(m)
-       M_column_ij = &
-            window_modes_i * window_modes_j
-
-    else
-       ! Same-orientation pseudo cross-product:
-       !
-       ! C_hat_ij(m) =
-       ! T_hat_i(m) conjugate[T_hat_j(m)]
-       C_hat_ij = &
-            masked_modes_i * conjg(masked_modes_j)
-
-       ! First column:
-       !
-       ! M_ij(m,0) =
-       ! W_i(m) conjugate[W_j(m)]
-       M_column_ij = &
-            window_modes_i * conjg(window_modes_j)
-    end if
-
-  end subroutine build_master_pair_inputs
 
   subroutine calculate_coupling_eigenvalues( &
        & nphi, &
@@ -1115,6 +1124,7 @@ contains
        & mask_transforms, &
        & auto_f_reg, &
        & auto_denominator, &
+       & auto_modes, &
        & auto_valid)
 
     implicit none
@@ -1133,6 +1143,9 @@ contains
     real(dp), intent(out) :: &
          & auto_denominator(0:npix-1)
 
+    real(FP), intent(out) :: &
+         & auto_modes(0:,0:)
+
     logical, intent(out) :: &
          & auto_valid(0:npix-1)
 
@@ -1143,6 +1156,7 @@ contains
     real(dp) :: f_reg_auto
     real(dp) :: lambda_auto
     real(dp) :: denominator_auto
+    real(dp) :: f_lost_auto
 
     logical :: boundary_auto
 
@@ -1154,6 +1168,9 @@ contains
 
     FFT_COMPLEX :: &
          & C_hat_auto(circle%nphi_ring)
+
+    FFT_COMPLEX :: &
+         & C_hat_F_auto(circle%nphi_ring)
 
     FFT_COMPLEX :: &
          & M_column_auto(circle%nphi_ring)
@@ -1179,9 +1196,11 @@ contains
     !$omp& private( &
     !$omp& pixel, m, &
     !$omp& masked_modes, window_modes, &
-    !$omp& C_hat_auto, M_column_auto, &
+    !$omp& C_hat_auto, C_hat_F_auto, &
+    !$omp& M_column_auto, &
     !$omp& mu_auto, C_corrected_auto, &
     !$omp& f_reg_auto, lambda_auto, &
+    !$omp& f_lost_auto, &
     !$omp& denominator_auto, boundary_auto)
 
     do pixel = 0, npix - 1
@@ -1227,17 +1246,39 @@ contains
             & plan_master_forward, &
             & M_column_auto, mu_auto)
 #endif
-       ! Select the GCV regularisation for this
-       ! individual circle's auto problem.
-       call select_gcv_regularisation( &
-            & nphi, C_hat_auto, mu_auto, &
-            & f_reg_auto, lambda_auto, &
-            & boundary_auto)
+       if (use_flost_regularisation) then
+          ! Zero-frequency mask mode is the observed
+          ! fraction of this individual circle.
+          f_lost_auto = &
+               1.0_dp - &
+               real(mask_transforms(1,pixel), dp)
 
-       ! Apply the selected Tikhonov correction.
-       call apply_tikhonov_correction( &
-            & nphi, C_hat_auto, mu_auto, &
-            & lambda_auto, C_corrected_auto)
+#ifdef DFFT
+          call dfftw_execute_dft( &
+               & plan_master_forward, &
+               & C_hat_auto, C_hat_F_auto)
+#else
+          call sfftw_execute_dft( &
+               & plan_master_forward, &
+               & C_hat_auto, C_hat_F_auto)
+#endif
+
+          call apply_flost_regularisation( &
+               & nphi, C_hat_F_auto, mu_auto, &
+               & f_lost_auto, flost_A, &
+               & C_corrected_auto)
+          f_reg_auto = 0.0_dp
+       else
+          call select_regularisation( &
+               & nphi, C_hat_auto, mu_auto, &
+               & C_hat_F_auto, &
+               & f_reg_auto, lambda_auto, &
+               & boundary_auto)
+
+          call apply_tikhonov_correction( &
+               & nphi, C_hat_F_auto, mu_auto, &
+               & lambda_auto, C_corrected_auto)
+       end if
 
        ! Cache exactly the auto contribution used
        ! in the S-statistic denominator:
@@ -1246,7 +1287,12 @@ contains
        ! sum_{m=m_min}^{Nphi/2}
        ! m Re[C_corrected_aa(m)].
        denominator_auto = 0.0_dp
+       
        do m = m_min, nphi/2
+       
+          auto_modes(m,pixel) = &
+               real(C_corrected_auto(m + 1), FP)
+       
           denominator_auto = &
                denominator_auto + &
                dble(m) * &
@@ -1276,7 +1322,9 @@ contains
        & smax, beta_max_bin, valid_pair, &
        & selected_f_reg_ij_out, &
        & selected_f_reg_ii_out, &
-       & selected_f_reg_jj_out)
+       & selected_f_reg_jj_out, &
+       & selected_f_lost_out, &
+       & psd_fail_modes_out)
 
     implicit none
 
@@ -1304,31 +1352,48 @@ contains
     real(dp), optional, intent(out) :: &
          & selected_f_reg_jj_out
 
-    integer :: nphi
+     real(dp), optional, intent(out) :: &
+          & selected_f_lost_out
+
+     integer(8), optional, intent(out) :: &
+          & psd_fail_modes_out
+
+     integer :: nphi
+     integer :: m
+     integer :: support_index
+     integer :: beta_index
+     integer :: bin_index
+     integer :: rho_bin_index
+     integer :: rho_thread_id
+     integer(8) :: psd_fail_local
+     
+     real(dp) :: auto_i
+     real(dp) :: auto_j
+     real(dp) :: cross_real
+     real(dp) :: cross_imag
+     real(dp) :: trace_g
+     real(dp) :: determinant_g
+     real(dp) :: rho_m
 
     real(dp) :: &
          & f_lost_by_beta(circle1%nphi_ring)
 
+    FFT_COMPLEX :: &
+         & joint_modes(circle1%nphi_ring/2 + 1)
+
     logical :: has_eligible_beta
     logical :: valid_s
 
-    ! Complete cyclic masked-temperature spectra.
+    ! Stored non-negative-frequency cross product.
     FFT_COMPLEX :: &
-         & masked_modes_i(circle1%nphi_ring)
+         & C_hat_half_ij(circle1%nphi_ring/2 + 1)
 
-    FFT_COMPLEX :: &
-         & masked_modes_j(circle1%nphi_ring)
-
-    ! Complete cyclic window spectra.
-    FFT_COMPLEX :: &
-         & window_modes_i(circle1%nphi_ring)
-
-    FFT_COMPLEX :: &
-         & window_modes_j(circle1%nphi_ring)
-
-    ! Cross pseudo-mode product and coupling column.
+    ! Complete cyclic cross pseudo-mode product.
     FFT_COMPLEX :: &
          & C_hat_ij(circle1%nphi_ring)
+
+    FFT_COMPLEX :: &
+         & C_hat_F_ij(circle1%nphi_ring)
 
     FFT_COMPLEX :: &
          & M_column_ij(circle1%nphi_ring)
@@ -1347,11 +1412,25 @@ contains
 
     real(dp) :: denominator_ii
     real(dp) :: denominator_jj
+    real(dp) :: support_f_lost
 
     logical :: boundary_ij
-
     real(dp) :: &
          & S_by_beta(circle1%nphi_ring)
+    real(dp) :: &
+         & S_support( &
+         & circle1%nphi_ring, n_flost_support)
+    
+    FFT_COMPLEX :: &
+         & C_corrected_support( &
+         & circle1%nphi_ring, n_flost_support)
+
+    real(dp) :: &
+         & rho_modes(0:circle1%nphi_ring/2)
+    
+    real(dp) :: &
+         & rho_support( &
+         & 0:circle1%nphi_ring/2, n_flost_support)
 
     nphi = circle1%nphi_ring
 
@@ -1359,6 +1438,11 @@ contains
     smax = -huge(1.0_dp)
     beta_max_bin = -1
     valid_pair = .false.
+    psd_fail_local = 0_8
+    
+    if (present(psd_fail_modes_out)) then
+       psd_fail_modes_out = 0_8
+    end if
 
     ! Calculate the lost matched-pair fraction
     ! separately for every beta.
@@ -1366,7 +1450,8 @@ contains
          & circle1, circle2, &
          & mask_transforms, &
          & f_lost_by_beta, &
-         & has_eligible_beta)
+         & has_eligible_beta, &
+         & joint_modes)
 
     ! Skip the circle pair if no beta satisfies
     ! f_lost(beta) <= 0.5.
@@ -1393,59 +1478,29 @@ contains
     denominator_jj = &
          master_auto_denominator(circle2%pixel)
 
-    ! Expand the stored r2c masked-temperature
-    ! transforms into complete cyclic spectra.
+    ! Reuse the cross-window product already calculated
+    ! for f_lost(beta).
     call expand_r2c_spectrum( &
-         & masked_circle_transforms( &
-         & :,circle1%pixel), &
-         & nphi, masked_modes_i)
-
-    call expand_r2c_spectrum( &
-         & masked_circle_transforms( &
-         & :,circle2%pixel), &
-         & nphi, masked_modes_j)
-
-    ! Expand the stored r2c window transforms.
-    call expand_r2c_spectrum( &
-         & mask_transforms(:,circle1%pixel), &
-         & nphi, window_modes_i)
-
-    call expand_r2c_spectrum( &
-         & mask_transforms(:,circle2%pixel), &
-         & nphi, window_modes_j)
-
+         & joint_modes, nphi, M_column_ij)
+    
     if (orientable) then
-
-       ! Orientable matching:
-       !
-       ! C_hat_ij(m) =
-       ! T_hat_i(m) T_hat_j(m)
-       C_hat_ij = &
-            masked_modes_i * masked_modes_j
-
-       ! First column of the cross-coupling matrix:
-       !
-       ! M_ij(m,0) = W_i(m) W_j(m)
-       M_column_ij = &
-            window_modes_i * window_modes_j
-
+    
+       ! Orientable cross product on the stored
+       ! non-negative-frequency modes.
+       C_hat_half_ij = &
+            masked_circle_transforms(:,circle1%pixel) * &
+            masked_circle_transforms(:,circle2%pixel)
     else
-
-       ! Non-orientable matching:
-       !
-       ! C_hat_ij(m) =
-       ! T_hat_i(m) conjugate[T_hat_j(m)]
-       C_hat_ij = &
-            masked_modes_i * conjg(masked_modes_j)
-
-       ! First column of the cross-coupling matrix:
-       !
-       ! M_ij(m,0) =
-       ! W_i(m) conjugate[W_j(m)]
-       M_column_ij = &
-            window_modes_i * conjg(window_modes_j)
-
+       ! Non-orientable cross product on the stored
+       ! non-negative-frequency modes.
+       C_hat_half_ij = &
+            masked_circle_transforms(:,circle1%pixel) * &
+            conjg(masked_circle_transforms(:,circle2%pixel))
     end if
+    
+    ! Complete the cyclic cross pseudo-mode product.
+    call expand_r2c_spectrum( &
+         & C_hat_half_ij, nphi, C_hat_ij)
 
     ! Because the coupling matrix is circulant,
     ! its eigenvalues are the DFT of its first column:
@@ -1461,14 +1516,115 @@ contains
          & M_column_ij, mu_ij)
 #endif
 
-    ! Select regularisation only for the
-    ! geometry-dependent cross problem.
-    call select_gcv_regularisation( &
-         & nphi, C_hat_ij, mu_ij, &
-         & f_reg_ij, lambda_ij, boundary_ij)
+    if (use_flost_regularisation) then
+       f_reg_ij = 0.0_dp
+
+       ! Transform the cross pseudo-product into the
+       ! coupling eigenbasis once for all five bins.
+#ifdef DFFT
+       call dfftw_execute_dft( &
+            & plan_master_forward, &
+            & C_hat_ij, C_hat_F_ij)
+#else
+       call sfftw_execute_dft( &
+            & plan_master_forward, &
+            & C_hat_ij, C_hat_F_ij)
+#endif
+
+       ! One reconstruction for each f_lost bin.
+       do support_index = 1, n_flost_support
+          support_f_lost = &
+               flost_support(support_index)
+
+          call apply_flost_regularisation( &
+               & nphi, C_hat_F_ij, mu_ij, &
+               & support_f_lost, flost_A, &
+               & C_corrected_support(:,support_index))
+
+          ! Calculate rho_m once for this reconstructed support,
+          ! only when rho filtering is actually requested.
+          if (rho_tolerance < 1.0_dp .or. &
+              & write_rho_hist) then
+             call calculate_rho_modes( &
+                  & nphi, &
+                  & circle1%pixel, &
+                  & circle2%pixel, &
+                  & C_corrected_support(:,support_index), &
+                  & rho_support(:,support_index))
+          end if
+
+          call calculate_master_s_by_beta( &
+               & nphi, &
+               & C_corrected_support(:,support_index), &
+               & denominator_ii, &
+               & denominator_jj, &
+               & circle1%pixel, &
+               & circle2%pixel, &
+               & rho_support(:,support_index), &
+               & S_support(:,support_index), &
+               & valid_s)
+          if (.not. valid_s) return
+       end do
+
+       ! For each beta, use the S(beta) curve
+       ! corresponding to its own f_lost bin.
+       do beta_index = 1, nphi
+          if (f_lost_by_beta(beta_index) > 0.5_dp) then
+             S_by_beta(beta_index) = &
+                  -huge(1.0_dp)
+          else
+             bin_index = &
+                  min( &
+                  n_flost_support, &
+                  int( &
+                  f_lost_by_beta(beta_index) / &
+                  0.1_dp) + 1)
+
+             S_by_beta(beta_index) = &
+                  S_support(beta_index,bin_index)
+          end if
+       end do
+    else
+       ! Existing GCV or no-regularisation route.
+       call select_regularisation( &
+            & nphi, C_hat_ij, mu_ij, &
+            & C_hat_F_ij, &
+            & f_reg_ij, lambda_ij, boundary_ij)
+
+       call apply_tikhonov_correction( &
+            & nphi, C_hat_F_ij, mu_ij, &
+            & lambda_ij, C_corrected_ij)
+       
+       ! Calculate rho_m once only when S filtering needs it.
+       if (rho_tolerance < 1.0_dp .or. &
+           & write_rho_hist) then
+          call calculate_rho_modes( &
+               & nphi, &
+               & circle1%pixel, &
+               & circle2%pixel, &
+               & C_corrected_ij, &
+               & rho_modes)
+       end if
+       
+       call calculate_master_s_by_beta( &
+            & nphi, &
+            & C_corrected_ij, &
+            & denominator_ii, &
+            & denominator_jj, &
+            & circle1%pixel, &
+            & circle2%pixel, &
+            & rho_modes, &
+            & S_by_beta, valid_s)
+
+       if (.not. valid_s) return
+       where (f_lost_by_beta > 0.5_dp)
+          S_by_beta = -huge(1.0_dp)
+       end where
+    end if
 
     ! Return all three selected fractions when requested.
-    ! ii and jj come from the cache.
+    ! For f_lost regularisation there is no scalar f_reg,
+    ! so these values are zero.
     if (present(selected_f_reg_ij_out)) then
        selected_f_reg_ij_out = f_reg_ij
     end if
@@ -1481,49 +1637,153 @@ contains
        selected_f_reg_jj_out = f_reg_jj
     end if
 
-    ! Apply the Tikhonov correction only to the
-    ! geometry-dependent cross-mode product.
-    call apply_tikhonov_correction( &
-         & nphi, C_hat_ij, mu_ij, &
-         & lambda_ij, C_corrected_ij)
-
-    ! Calculate S(beta) using the corrected cross
-    ! product and the two cached auto denominators.
-    call calculate_master_s_by_beta( &
-         & nphi, &
-         & C_corrected_ij, &
-         & denominator_ii, &
-         & denominator_jj, &
-         & S_by_beta, valid_s)
-
-    if (.not. valid_s) return
-
-    ! Exclude beta bins where more than half of
-    ! the matched sample pairs are lost.
-    where (f_lost_by_beta > 0.5_dp)
-
-       S_by_beta = -huge(1.0_dp)
-
-    end where
-
     ! Same beta maximisation as the original
     ! matched-circle S-statistic.
     beta_max_bin = &
          maxloc(S_by_beta, dim=1) - 1
-
     smax = &
          S_by_beta(beta_max_bin + 1)
 
-    valid_pair = .true.
+    if (use_flost_regularisation) then
+       bin_index = &
+            min( &
+            n_flost_support, &
+            int( &
+            f_lost_by_beta(beta_max_bin + 1) / &
+            0.1_dp) + 1)
+    
+       C_corrected_ij = &
+            C_corrected_support(:,bin_index)
+    
+       if (rho_tolerance < 1.0_dp .or. &
+           & write_rho_hist) then
+    
+          rho_modes = &
+               rho_support(:,bin_index)
+       end if
+    end if
 
+    ! ==================================================
+    ! PSD check and optional rho histogram
+    ! ==================================================
+    if (present(psd_fail_modes_out)) then
+       if (write_rho_hist) then
+#ifdef _OPENMP
+          rho_thread_id = omp_get_thread_num() + 1
+#else
+          rho_thread_id = 1
+#endif
+          if (rho_thread_id > MAX_THREAD_NUM) then
+             write(*,*) &
+                  "too many threads, please adjust MAX_THREAD_NUM and recompile"
+             stop
+          end if
+       end if
+    
+       do m = m_min, nphi/2
+          auto_i = &
+               real( &
+                    master_auto_modes(m,circle1%pixel), &
+                    dp &
+               )
+    
+          auto_j = &
+               real( &
+                    master_auto_modes(m,circle2%pixel), &
+                    dp &
+               )
+    
+          cross_real = &
+               real(C_corrected_ij(m + 1), dp)
+    
+          cross_imag = &
+               real(aimag(C_corrected_ij(m + 1)), dp)
+    
+          trace_g = &
+               auto_i + auto_j
+    
+          determinant_g = &
+               auto_i * auto_j - &
+               cross_real * cross_real - &
+               cross_imag * cross_imag
+    
+          if (write_rho_hist) then
+             rho_m = rho_modes(m)
+    
+             rho_bin_index = &
+                  int((rho_m - rho_min) / rho_bin_width) + 1
+    
+             rho_bin_index = &
+                  max(1, min(n_rho_bins, rho_bin_index))
+    
+             rho_hist_thread(rho_bin_index,rho_thread_id) = &
+                  rho_hist_thread(rho_bin_index,rho_thread_id) + 1_8
+          end if
+    
+          if (trace_g < 0.0_dp .or. &
+              & determinant_g < 0.0_dp) then
+    
+             psd_fail_local = &
+                  psd_fail_local + 1_8
+          end if
+       end do
+       psd_fail_modes_out = &
+            psd_fail_local
+    end if
+
+    if (present(selected_f_lost_out)) then
+       selected_f_lost_out = &
+            f_lost_by_beta(beta_max_bin + 1)
+    end if
+    valid_pair = .true.
   end subroutine get_master_smax
 
-  subroutine select_gcv_regularisation( &
-       & nphi, C_hat, mu, &
+  subroutine select_regularisation( &
+       & nphi, C_hat, mu, C_hat_F, &
        & selected_f_reg, &
        & selected_lambda, &
        & selected_at_boundary)
 
+    implicit none
+
+    integer, intent(in) :: nphi
+    FFT_COMPLEX, intent(in) :: C_hat(nphi)
+    FFT_COMPLEX, intent(in) :: mu(nphi)
+    FFT_COMPLEX, intent(out) :: C_hat_F(nphi)
+    real(dp), intent(out) :: selected_f_reg
+    real(dp), intent(out) :: selected_lambda
+    logical, intent(out) :: selected_at_boundary
+
+    if (use_gcv_regularisation) then
+       call select_gcv_regularisation( &
+            & nphi, C_hat, mu, C_hat_F, &
+            & selected_f_reg, &
+            & selected_lambda, &
+            & selected_at_boundary)
+    else
+
+#ifdef DFFT
+       call dfftw_execute_dft( &
+            & plan_master_forward, &
+            & C_hat, C_hat_F)
+#else
+       call sfftw_execute_dft( &
+            & plan_master_forward, &
+            & C_hat, C_hat_F)
+#endif
+       selected_f_reg = 0.0_dp
+       selected_lambda = 0.0_dp
+       selected_at_boundary = .false.
+    end if
+
+  end subroutine select_regularisation
+
+  subroutine select_gcv_regularisation( &
+       & nphi, C_hat, mu, C_hat_F, &
+       & selected_f_reg, &
+       & selected_lambda, &
+       & selected_at_boundary)
+  
     implicit none
     integer, intent(in) :: nphi
 
@@ -1536,6 +1796,9 @@ contains
     ! mu(q), q = 0, ..., Nphi - 1.
     FFT_COMPLEX, intent(in) :: &
          & mu(nphi)
+
+    FFT_COMPLEX, intent(out) :: &
+         & C_hat_F(nphi)
 
     real(dp), intent(out) :: selected_f_reg
     real(dp), intent(out) :: selected_lambda
@@ -1594,8 +1857,6 @@ contains
     real(dp) :: mean_residual_filter
     real(dp) :: gcv_value
     real(dp) :: best_gcv_value
-
-    FFT_COMPLEX :: C_hat_F(nphi)
 
     ! Transform from the circle-mode-product index m
     ! into the coupling eigenbasis q:
@@ -1813,22 +2074,19 @@ contains
              exit
           end if
        end if
-
     end do
-
   end subroutine select_gcv_regularisation
 
   subroutine apply_tikhonov_correction( &
-       & nphi, C_hat, mu, lambda, C_corrected)
+       & nphi, C_hat_F, mu, lambda, C_corrected)
 
     implicit none
-
     integer, intent(in) :: nphi
 
-    ! Directly measured masked pseudo-mode product
-    ! in the circle-mode index m.
-    FFT_COMPLEX, intent(in) :: &
-         & C_hat(nphi)
+  ! Masked pseudo-mode product already transformed
+  ! into the coupling eigenbasis by GCV.
+  FFT_COMPLEX, intent(in) :: &
+       & C_hat_F(nphi)
 
     ! Coupling eigenvalues in the q basis.
     FFT_COMPLEX, intent(in) :: &
@@ -1845,31 +2103,14 @@ contains
     integer  :: q
     real(dp) :: lambda_squared
     real(dp) :: filter_denominator
-
-    FFT_COMPLEX :: C_hat_F(nphi)
     FFT_COMPLEX :: C_corrected_F(nphi)
 
     lambda_squared = lambda**2
 
-    ! Transform the pseudo-mode product into
-    ! the coupling-matrix eigenbasis:
-    !
-    ! C_hat_F(q) = DFT[C_hat](q).
-
-#ifdef DFFT
-    call dfftw_execute_dft( &
-         & plan_master_forward, &
-         & C_hat, C_hat_F)
-#else
-    call sfftw_execute_dft( &
-         & plan_master_forward, &
-         & C_hat, C_hat_F)
-#endif
-
     ! Apply the Tikhonov inverse response
     ! independently to every coupling eigenmode.
-    do q = 1, nphi
 
+    do q = 1, nphi
        filter_denominator = &
             dble(abs(mu(q)))**2 + &
             lambda_squared
@@ -1879,9 +2120,13 @@ contains
        ! conjugate[mu(q)] /
        ! (|mu(q)|^2 + lambda^2)
        ! times C_hat_F(q).
-       C_corrected_F(q) = &
-            conjg(mu(q)) * C_hat_F(q) / &
-            filter_denominator
+       if (filter_denominator > 0.0_dp) then
+          C_corrected_F(q) = &
+               conjg(mu(q)) * C_hat_F(q) / &
+               filter_denominator
+       else
+          C_corrected_F(q) = 0.0
+       end if
     end do
 
     ! Transform from the coupling eigenbasis q
@@ -1899,20 +2144,176 @@ contains
     ! include the inverse-DFT factor 1/Nphi.
     C_corrected = &
          C_corrected / dble(nphi)
-
   end subroutine apply_tikhonov_correction
+
+  subroutine apply_flost_regularisation( &
+       & nphi, C_hat_F, mu, f_lost, A, C_corrected)
+
+    implicit none
+
+    integer, intent(in) :: nphi
+    FFT_COMPLEX, intent(in) :: &
+         & C_hat_F(nphi)
+    FFT_COMPLEX, intent(in) :: &
+         & mu(nphi)
+    real(dp), intent(in) :: f_lost
+    real(dp), intent(in) :: A
+    FFT_COMPLEX, intent(out) :: &
+         & C_corrected(nphi)
+    integer :: q
+    real(dp) :: maximum_mu
+    real(dp) :: mu_squared
+    real(dp) :: spectral_weight
+    real(dp) :: lambda_squared
+    real(dp) :: filter_denominator
+
+    FFT_COMPLEX :: &
+         & C_corrected_F(nphi)
+
+    if (f_lost < 0.0_dp .or. &
+        & f_lost >= 1.0_dp) then
+
+       stop "f_lost must satisfy 0 <= f_lost < 1."
+    end if
+
+    maximum_mu = &
+         dble(maxval(abs(mu)))
+
+    if (maximum_mu <= 0.0_dp) then
+       stop "All coupling eigenvalues are zero."
+    end if
+
+    do q = 1, nphi
+       mu_squared = &
+            dble(abs(mu(q)))**2
+
+       spectral_weight = &
+            1.0_dp - &
+            mu_squared / maximum_mu**2
+
+       lambda_squared = &
+            A * maximum_mu**2 * &
+            f_lost / (1.0_dp - f_lost) * &
+            spectral_weight
+
+       filter_denominator = &
+            mu_squared + lambda_squared
+
+       if (filter_denominator > 0.0_dp) then
+          C_corrected_F(q) = &
+               conjg(mu(q)) * C_hat_F(q) / &
+               filter_denominator
+       else
+          C_corrected_F(q) = 0.0
+       end if
+    end do
+
+    ! Transform back to the circle-mode index m.
+#ifdef DFFT
+    call dfftw_execute_dft( &
+         & plan_master_backward, &
+         & C_corrected_F, C_corrected)
+#else
+    call sfftw_execute_dft( &
+         & plan_master_backward, &
+         & C_corrected_F, C_corrected)
+#endif
+    C_corrected = &
+         C_corrected / dble(nphi)
+
+  end subroutine apply_flost_regularisation
+
+  subroutine calculate_rho_modes( &
+       & nphi, pixel_i, pixel_j, &
+       & C_corrected_ij, rho_out)
+  
+    implicit none
+    integer, intent(in) :: nphi
+    integer(dp), intent(in) :: pixel_i
+    integer(dp), intent(in) :: pixel_j
+    FFT_COMPLEX, intent(in) :: &
+         & C_corrected_ij(nphi)
+    real(dp), intent(out) :: &
+         & rho_out(0:nphi/2)
+  
+    integer :: m
+    real(dp) :: auto_i
+    real(dp) :: auto_j
+    real(dp) :: cross_real
+    real(dp) :: cross_imag
+    real(dp) :: trace_g
+    real(dp) :: eigen_gap
+    real(dp) :: lambda_minus
+    real(dp) :: lambda_plus
+    real(dp) :: eigen_scale
+
+    rho_out = 0.0_dp
+    do m = m_min, nphi/2
+  
+       auto_i = &
+            real(master_auto_modes(m,pixel_i), dp)
+  
+       auto_j = &
+            real(master_auto_modes(m,pixel_j), dp)
+  
+       cross_real = &
+            real(C_corrected_ij(m + 1), dp)
+  
+       cross_imag = &
+            real(aimag(C_corrected_ij(m + 1)), dp)
+  
+       trace_g = &
+            auto_i + auto_j
+  
+       eigen_gap = &
+            sqrt( &
+            (auto_i - auto_j) * (auto_i - auto_j) + &
+            4.0_dp * ( &
+            cross_real * cross_real + &
+            cross_imag * cross_imag &
+            ) &
+            )
+  
+       lambda_minus = &
+            0.5_dp * (trace_g - eigen_gap)
+  
+       lambda_plus = &
+            0.5_dp * (trace_g + eigen_gap)
+  
+       eigen_scale = &
+            max(abs(lambda_minus), abs(lambda_plus))
+  
+       if (eigen_scale > 0.0_dp) then
+          rho_out(m) = &
+               lambda_minus / eigen_scale
+       else
+          rho_out(m) = 0.0_dp
+       end if
+    end do
+  
+  end subroutine calculate_rho_modes
 
   subroutine calculate_master_s_by_beta( &
        & nphi, &
        & C_corrected_ij, &
        & denominator_ii, &
        & denominator_jj, &
+       & pixel_i, &
+       & pixel_j, &
+       & rho_in, &
        & S_by_beta, valid_s)
-
+  
     implicit none
+  
     integer, intent(in) :: nphi
+    integer(dp), intent(in) :: pixel_i
+    integer(dp), intent(in) :: pixel_j
+  
     FFT_COMPLEX, intent(in) :: &
          & C_corrected_ij(nphi)
+  
+    real(dp), intent(in) :: &
+         & rho_in(0:nphi/2)
 
     ! Cached weighted auto contributions:
     !
@@ -1926,37 +2327,63 @@ contains
     real(dp), intent(out) :: &
          & S_by_beta(nphi)
     logical, intent(out) :: valid_s
+
     integer :: m
     real(dp) :: denominator
+    real(dp) :: auto_i
+    real(dp) :: auto_j
     FFT_COMPLEX :: &
          & numerator_modes(nphi/2 + 1)
+
     real(FP) :: &
          & numerator_by_beta(nphi)
+
     numerator_modes = 0.0
-
-    ! This is exactly the same denominator as before:
-    !
-    ! sum_m m [
-    !     Re(C_corrected_ii(m))
-    !     + Re(C_corrected_jj(m))
-    ! ]
-    denominator = &
-         denominator_ii + denominator_jj
-
+    ! ==================================================
+    ! No rho filtering: use the original calculation
+    ! ==================================================
+    if (rho_tolerance >= 1.0_dp) then
+       denominator = &
+            denominator_ii + denominator_jj
+       do m = m_min, nphi/2
+          numerator_modes(m + 1) = &
+               real(m, FP) * &
+               C_corrected_ij(m + 1)
+       end do
+    
+    ! ==================================================
+    ! Rho filtering
+    ! ==================================================
+    else
+       denominator = 0.0_dp
+       do m = m_min, nphi/2
+          ! Reject the whole recovered mode m.
+          if (abs(rho_in(m)) > rho_tolerance) cycle
+    
+          ! Accepted mode: numerator contribution.
+          numerator_modes(m + 1) = &
+               real(m, FP) * &
+               C_corrected_ij(m + 1)
+    
+          ! Accepted mode: corresponding denominator
+          ! contribution from the same m.
+          auto_i = &
+               real(master_auto_modes(m,pixel_i), dp)
+    
+          auto_j = &
+               real(master_auto_modes(m,pixel_j), dp)
+    
+          denominator = &
+               denominator + &
+               dble(m) * (auto_i + auto_j)
+       end do
+    end if
+    
     if (denominator <= 0.0_dp) then
        S_by_beta = -huge(1.0_dp)
        valid_s = .false.
        return
     end if
-
-    ! Construct the same weighted numerator modes
-    ! used by the original MASTER-like statistic.
-    do m = m_min, nphi/2
-
-       numerator_modes(m + 1) = &
-            real(m, FP) * &
-            C_corrected_ij(m + 1)
-    end do
 
     ! Obtain the cross-correlation numerator
     ! simultaneously for every beta.
@@ -1976,6 +2403,8 @@ contains
     valid_s = .true.
 
   end subroutine calculate_master_s_by_beta
+
+
 
   subroutine fill_circle_transforms( &
        & npix, circle, nside_map, map, &
@@ -2066,33 +2495,25 @@ contains
        circle%phi = &
             pix2ang_table(circle%pixel)%phi
 
-       ! Sample the original temperature circle.
-       call get_temperature_along_circle( &
-            & circle, &
-            & nside_map, &
-            & map, &
-            & use_pixel_average, &
-            & nest2ring_table, &
-            & temp_in)
-
-       ! Sample the mask along exactly the same circle.
-       call get_temperature_along_circle( &
-            & circle, &
-            & nside_map, &
-            & obs_mask, &
-            & use_pixel_average, &
-            & nest2ring_table, &
-            & mask_in)
+    ! Sample the temperature and mask using the
+    ! same circle geometry.
+    call get_temperature_along_circle( &
+         & circle, &
+         & nside_map, &
+         & map, &
+         & use_pixel_average, &
+         & nest2ring_table, &
+         & temp_in, &
+         & obs_mask, &
+         & mask_in)
 
        ! Convert the sampled mask to a binary window:
        ! 1 = observed, 0 = masked.
        where ( &
             real(mask_in, dp) >= mask_threshold)
-
           mask_in = real(1, FP)
 
        elsewhere
-
           mask_in = real(0, FP)
 
        end where
@@ -2205,15 +2626,21 @@ contains
 
   end subroutine get_rotation_matrix
 
-  subroutine get_temperature_along_circle(circle, nside_map, map, pixel_average, nest2ring_table, t, obs_mask, mask_threshold, valid)
+  subroutine get_temperature_along_circle( &
+       & circle, nside_map, map, pixel_average, &
+       & nest2ring_table, t, obs_mask, mask_t, &
+       & mask_threshold, valid)
+
     implicit none
     type(tcircle), intent(in) :: circle
     integer,  intent(in) :: nside_map
     real(sp), intent(in) :: map(0:)
     logical,  intent(in) :: pixel_average
     integer,  intent(in) :: nest2ring_table(0:)
-    real(FP), intent(out):: t(:)
-    real(sp), intent(in), optional :: obs_mask(0:)
+    real(FP), intent(out) :: t(:)
+    real(sp), intent(in) :: obs_mask(0:)
+    real(FP), intent(out) :: mask_t(:)
+    
     real(dp), intent(in), optional :: mask_threshold
     logical,  intent(out), optional :: valid(:)
     real(dp) :: rotation_matrix(1:3,1:3), n_ipix(1:3), n_kpix(1:3)
@@ -2258,14 +2685,37 @@ contains
              endif
              nb(m)=nest2ring_table(nbnest(m))
           enddo
+
           if(numnb.eq.8) then
-             t(iphi) = DBLE((map(jpix)*2.6137104+(map(nb(1))+map(nb(3))+map(nb(5))+map(nb(7)))*0.9583863776+(map(nb(2))+map(nb(4))+map(nb(6))+map(nb(8)))*0.692777175)/9.21836461)
+             t(iphi) = DBLE( &
+                  (map(jpix)*2.6137104 + &
+                  (map(nb(1))+map(nb(3))+map(nb(5))+map(nb(7)))*0.9583863776 + &
+                  (map(nb(2))+map(nb(4))+map(nb(6))+map(nb(8)))*0.692777175) / &
+                  9.21836461)
+
+             mask_t(iphi) = DBLE( &
+                  (obs_mask(jpix)*2.6137104 + &
+                  (obs_mask(nb(1))+obs_mask(nb(3))+obs_mask(nb(5))+obs_mask(nb(7)))*0.9583863776 + &
+                  (obs_mask(nb(2))+obs_mask(nb(4))+obs_mask(nb(6))+obs_mask(nb(8)))*0.692777175) / &
+                  9.21836461)
           else
-             t(iphi) = DBLE((map(jpix)*2.6137104+(map(nb(1))+map(nb(3))+map(nb(5))+map(nb(7)))*0.9583863776+(map(nb(2))+map(nb(4))+map(nb(6)))*0.692777175)/8.525587431)
+             t(iphi) = DBLE( &
+                  (map(jpix)*2.6137104 + &
+                  (map(nb(1))+map(nb(3))+map(nb(5))+map(nb(7)))*0.9583863776 + &
+                  (map(nb(2))+map(nb(4))+map(nb(6)))*0.692777175) / &
+                  8.525587431)
+
+             mask_t(iphi) = DBLE( &
+                  (obs_mask(jpix)*2.6137104 + &
+                  (obs_mask(nb(1))+obs_mask(nb(3))+obs_mask(nb(5))+obs_mask(nb(7)))*0.9583863776 + &
+                  (obs_mask(nb(2))+obs_mask(nb(4))+obs_mask(nb(6)))*0.692777175) / &
+                  8.525587431)
           endif
        else
           t(iphi) = DBLE(map(jpix))
+          mask_t(iphi) = DBLE(obs_mask(jpix))
        end if
+
     end do
   end subroutine get_temperature_along_circle
 
@@ -2528,7 +2978,8 @@ contains
        & smax, bestcircle1, bestcircle2, &
        & position_smax, position_circle2, &
        & position_beta_max_bin, &
-       & analysed_circles, every_nth_smax_file)
+       & analysed_circles, every_nth_smax_file, &
+       & psd_fail_modes_out)
 
     implicit none
 
@@ -2548,14 +2999,16 @@ contains
     integer,       intent(out) :: position_beta_max_bin
     integer(dp), intent(inout) :: analysed_circles
     integer, intent(in) :: every_nth_smax_file
+    integer(8), intent(out) :: psd_fail_modes_out
     integer  :: j
     integer  :: beta_try
     real(dp) :: smax_try
     logical :: valid_pair
+    integer(8) :: pair_psd_fail
     position_smax = -huge(1.0_dp)
     position_beta_max_bin = -1
     position_circle2%pixel = -1
-
+    psd_fail_modes_out = 0_8
     do j = 0, opposite_number - 1
 
        circle2%pixel = opposite_list(j)
@@ -2568,8 +3021,12 @@ contains
             & circle1, circle2, &
             & masked_circle_transforms, &
             & mask_transforms, &
-            & smax_try, beta_try, valid_pair)
+            & smax_try, beta_try, valid_pair, &
+            & psd_fail_modes_out=pair_psd_fail)
+
        if (.not. valid_pair) cycle
+       psd_fail_modes_out = &
+            psd_fail_modes_out + pair_psd_fail
 
        if (smax_try .gt. position_smax) then
           position_smax = smax_try
