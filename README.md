@@ -1,16 +1,16 @@
 ## Main changes in this branch
 
-### 1. Conditional Gaussian standardisation of $D^{\mathrm{diff}}$
+### 1. Conditional Gaussian standardisation of D-diff
 
 The original search maximised the raw statistic
 
-$$
+```math
 D^{\mathrm{diff}}(\beta).
-$$
+```
 
-The new pipeline can instead compare each value with its conditional Gaussian null distribution,
+The new pipeline can instead compare each value with the Gaussian null distribution conditioned on circle radius and the number of jointly valid samples,
 
-$$
+```math
 D^{\mathrm{diff}}
 \mid
 (\alpha, N_{\mathrm{joint}})
@@ -20,11 +20,11 @@ D^{\mathrm{diff}}
 \mu(\alpha,N_{\mathrm{joint}}),
 \sigma^2(\alpha,N_{\mathrm{joint}})
 \right).
-$$
+```
 
 For each trial,
 
-$$
+```math
 p
 =
 P\left(
@@ -34,70 +34,76 @@ D^{\mathrm{diff}}
 \mid
 \alpha,N_{\mathrm{joint}}
 \right),
-$$
+```
 
-and
+and the corresponding standardised score is
 
-$$
-Q=-\log_{10}p.
-$$
+```math
+Q=-\log_{10}(p).
+```
 
-The search can maximise $Q$ instead of raw $D^{\mathrm{diff}}$, allowing trials with different $N_{\mathrm{joint}}$ to be compared on the same null-calibrated scale.
+The search can maximise Q instead of the raw D-diff value. This allows trials with different values of N-joint to be compared on the same null-calibrated scale.
 
 ---
 
-### 2. Independent $D$ search
+### 2. Independent D search
 
-Previously, $D$ was mainly evaluated at the phase selected by $S$,
+Previously, D was mainly evaluated at the phase selected by the S statistic,
 
-$$
+```math
 D(\beta_S),
-$$
+```
 
-where
+where beta-S denotes the phase that maximises S.
 
-$$
-\beta_S=\operatorname*{arg\,max}_{\beta} S(\beta).
-$$
+The new pipeline also allows D to select its own circle pair and phase,
 
-The new pipeline also allows $D$ to select its own preferred circle pair and phase,
-
-$$
+```math
 D_{\max}
 =
-\max_{i,j,\beta} D_{ij}(\beta).
-$$
+\max_{i,j,\beta}
+D_{ij}(\beta).
+```
 
 ---
 
-### 3. Configurable separation range in $D^{\mathrm{diff}}$
+### 3. Configurable separation range in D-diff
 
 The old implementation used only
 
-$$
+```math
 s=1,2.
-$$
+```
 
 The new implementation allows
 
-$$
+```math
 s=1,2,\ldots,s_{\max},
-$$
+```
 
-with `d_diff_max_separation` controlling $s_{\max}$.
+where `d_diff_max_separation` sets the value of s-max.
 
-The combined statistic is
+For
 
-$$
+```math
+\Delta T_i^{(s)}(\phi)
+=
+T_i(\phi+s)-T_i(\phi),
+```
+
+the combined statistic is
+
+```math
 D^{\mathrm{diff}}(\beta)
 =
 \frac{
-2\sum_{s=1}^{s_{\max}}
+2
+\displaystyle\sum_{s=1}^{s_{\max}}
 \sum_{\phi}
 \Delta T_i^{(s)}(\phi)
 \Delta T_j^{(s)}(\phi,\beta)
 }{
-\sum_{s=1}^{s_{\max}}
+\displaystyle\sum_{s=1}^{s_{\max}}
 \sum_{\phi}
 \left[
 \left(\Delta T_i^{(s)}(\phi)\right)^2
@@ -105,8 +111,7 @@ D^{\mathrm{diff}}(\beta)
 \left(\Delta T_j^{(s)}(\phi,\beta)\right)^2
 \right]
 }.
-$$
-
+```
 
 # Circle-Search
 
