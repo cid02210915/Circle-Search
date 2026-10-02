@@ -1,3 +1,93 @@
+## Main changes in this branch
+
+### 1. Conditional Gaussian standardisation of \(D^{\mathrm{diff}}\)
+
+The original search maximised the raw statistic
+
+\[
+D^{\mathrm{diff}}(\beta).
+\]
+
+The new pipeline can instead use a conditional Gaussian null model,
+
+\[
+D^{\mathrm{diff}}
+\mid
+\left(\alpha,N_{\mathrm{joint}}\right)
+\sim
+\mathcal{N}
+\left[
+\mu(\alpha,N_{\mathrm{joint}}),
+\sigma^2(\alpha,N_{\mathrm{joint}})
+\right].
+\]
+
+For each trial,
+
+\[
+p
+=
+P
+\left(
+D_{\mathrm{null}}^{\mathrm{diff}}
+\ge
+D^{\mathrm{diff}}
+\mid
+\alpha,N_{\mathrm{joint}}
+\right),
+\]
+
+and the search statistic is
+
+\[
+Q
+=
+-\log_{10}p.
+\]
+
+This allows trials with different \(N_{\mathrm{joint}}\) to be compared on the
+same null-calibrated scale. The original raw-\(D^{\mathrm{diff}}\) search is
+still available. 
+
+### 2. Independent \(D\) search
+
+Previously, \(D\) was mainly evaluated at a phase selected by another
+statistic, for example
+
+\[
+D(\beta_S),
+\]
+
+where \(\beta_S\) is the phase that maximises \(S\).
+
+The new pipeline also supports a fully independent \(D\) search,
+
+\[
+D_{\max}
+=
+\max_{i,j,\beta}
+D_{ij}(\beta),
+\]
+
+so the best circle pair and phase are selected directly using \(D\) itself.
+
+### 3. Configurable separation range in \(D^{\mathrm{diff}}\)
+
+The old implementation fixed
+
+\[
+s=1,2.
+\]
+
+The new pipeline introduces
+
+\[
+s=1,2,\ldots,s_{\max},
+\]
+
+where \(s_{\max}\) is set through
+
+
 # Circle-Search
 
 `Circle-Search` is a research pipeline for topology-independent searches for matched circles in cosmic microwave background (CMB) temperature maps. It contains the original Fourier-space $S$-statistic, two additional real-space statistics, a MASTER-like mask-correction method, map-inpainting utilities, and the notebooks used for validation and null tests.
