@@ -263,7 +263,7 @@ or equivalently,
 p_{\mathrm{surv}}
 =
 \frac{1}{2}
-\operatorname{erfc}
+\mathrm{erfc}
 \left(
 \frac{z}{\sqrt{2}}
 \right).
