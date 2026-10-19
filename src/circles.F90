@@ -45,6 +45,8 @@ program circles
   end type tangle_range
 
   integer, parameter        :: MAX_THREAD_NUM=32
+  integer, parameter        :: SEP_ANGLE_BIN_MIN=0
+  integer, parameter        :: SEP_ANGLE_BIN_MAX=180
   integer                   :: d_diff_max_separation = 2
 
   integer                   :: nside_map !512  !Healpix resolution of upgraded map
@@ -113,6 +115,12 @@ program circles
   integer,      allocatable :: d_diff_max_beta_bin_result(:)
   integer,      allocatable :: d_diff_max_n_joint(:)
   integer,      allocatable :: d_diff_max_n_joint_result(:)
+
+  ! D_diff/Q maxima resolved by integer centre-separation angle.
+  ! First index: opening-angle index.
+  ! Second index: nearest integer centre separation in degrees.
+  real(dp), allocatable :: d_diff_sep_max(:,:)
+  real(dp), allocatable :: d_diff_sep_max_result(:,:)
 
   ! Gaussian null lookup for Q standardisation.
   ! Indexed by (iopening_angle, N_joint).
@@ -213,6 +221,13 @@ program circles
   logical :: d_diff_found_thread(MAX_THREAD_NUM)
   logical :: d_diff_found_local
 
+  real(dp) :: d_diff_sep_max_thread( &
+       SEP_ANGLE_BIN_MIN:SEP_ANGLE_BIN_MAX, MAX_THREAD_NUM)
+  
+  logical :: d_diff_sep_found_thread( &
+       SEP_ANGLE_BIN_MIN:SEP_ANGLE_BIN_MAX, MAX_THREAD_NUM)
+
+  integer                   :: partial_sep_file
   character(LEN=1000)       :: inifilename, outfilename, mapfilename, maskfilename
   character(LEN=1000)       :: d_filter_filename
   character(LEN=1000)       :: d_diff_gaussian_lookup_filename
@@ -222,6 +237,7 @@ program circles
   real(dp)                  :: min_separation_angle
   logical                   :: random_s = .false.
   integer                   :: thread_id, beta_max_bin
+  integer                   :: sep_angle_bin
   integer                   :: position_beta_max_bin
   integer                   :: MPIid=0
   integer                   :: MPIsize=1
@@ -332,7 +348,24 @@ program circles
      d_diff_max_circle2_pixel = 0
      d_diff_max_beta_bin = 0
      d_diff_max_n_joint = 0
+  
+     d_diff_sep_max = 0.0_dp
+     d_diff_sep_max_result = 0.0_dp
   end if
+
+#ifdef MPI
+  if (use_d_diff_statistics) then
+     open(newunit=partial_sep_file, &
+          file=trim(adjustl(inifilename(1:len_trim(inifilename)-4))) // &
+          "_q_diff_by_sep_partial_mpi_" // &
+          trim(adjustl(mpiid_string)) // ".dat", &
+          status="replace", action="write")
+
+     write(partial_sep_file,'(A)') &
+          "# separation_deg alpha_deg statistic_max"
+     call flush(partial_sep_file)
+  end if
+#endif
 
   do iopening_angle = nside_search/2 + mpiid, 2*nside_search, mpisize
 
@@ -408,6 +441,9 @@ program circles
         d_diff_found_thread = .false.
         d_diff_beta_thread = 0
         d_diff_n_joint_thread = 0
+
+        d_diff_sep_max_thread = -huge(1.0_dp)
+        d_diff_sep_found_thread = .false.
      end if
 
      if (write_every_nth_smax) then
@@ -434,6 +470,16 @@ program circles
      !$omp& reduction(+:analysed_circles, d_diff_analysed_pairs) &
      !$omp& default(shared)
 
+#ifdef _OPENMP
+          thread_id = omp_get_thread_num() + 1
+#else
+          thread_id = 1
+#endif
+          if (thread_id .gt. MAX_THREAD_NUM) then
+             write(*,*) "too many threads, please adjust MAX_THREAD_NUM and recompile"
+             stop
+          end if
+     
      smax = 0.
      d_best_local = -huge(1.0_dp)
      d_beta_local = 0
@@ -524,7 +570,6 @@ program circles
         end if
 
         if (use_d_diff_statistics) then
-
            call analyse_circle_pairs_d_diff( &
                 & circle1, circle2, &
                 & opposite_list, opposite_number, &
@@ -533,22 +578,12 @@ program circles
                 & d_diff_best_circle2_local, &
                 & d_diff_beta_local, &
                 & d_diff_n_joint_local, &
-                & d_diff_found_local)
+                & d_diff_found_local, &
+                & thread_id)
         end if
-
+        
      end do
      !$omp end do
-
-#ifdef _OPENMP
-     thread_id = omp_get_thread_num() + 1
-#else
-     thread_id = 1
-#endif
-
-     if (thread_id .gt. MAX_THREAD_NUM) then
-        write(*,*) "too many threads, please adjust MAX_THREAD_NUM and recompile"
-        stop
-     end if
 
      if (use_s_statistics) then
         smax_thread(thread_id) = smax
@@ -595,7 +630,40 @@ program circles
 
      deallocate(opposite_list)
      !$omp end parallel
-     
+
+     if (use_d_diff_statistics) then
+
+        do sep_angle_bin = SEP_ANGLE_BIN_MIN, SEP_ANGLE_BIN_MAX
+
+           if (any(d_diff_sep_found_thread(sep_angle_bin,:))) then
+              d_diff_sep_max(iopening_angle,sep_angle_bin) = &
+                   maxval( &
+                   d_diff_sep_max_thread(sep_angle_bin,:), &
+                   mask=d_diff_sep_found_thread(sep_angle_bin,:))
+           else
+              d_diff_sep_max(iopening_angle,sep_angle_bin) = 0.0_dp
+           end if
+        end do
+
+   ! =====================================================
+   ! Checkpoint this completed opening angle immediately.
+   ! =====================================================
+#ifdef MPI
+   do sep_angle_bin = SEP_ANGLE_BIN_MIN, SEP_ANGLE_BIN_MAX
+
+      if (dble(sep_angle_bin) + 0.5_dp < &
+           180.0_dp - min_separation_angle) cycle
+
+      write(partial_sep_file,*) &
+           sep_angle_bin, &
+           rad_to_deg(dble(circle1%opening_angle)), &
+           d_diff_sep_max(iopening_angle,sep_angle_bin)
+   end do
+   call flush(partial_sep_file)
+#endif
+
+end if
+
      if (use_d_statistics .and. .not. use_s_statistics) then
 
         if (any(d_found_thread)) then
@@ -713,9 +781,7 @@ program circles
 
            d_diff_max_n_joint(iopening_angle) = &
                 & d_diff_n_joint_thread(d_diff_best_thread)
-
         else
-
            d_diff_max_angle(iopening_angle) = 0.0_dp
            d_diff_max_circle1_pixel(iopening_angle) = 0
            d_diff_max_circle2_pixel(iopening_angle) = 0
@@ -723,7 +789,6 @@ program circles
            d_diff_max_n_joint(iopening_angle) = 0
 
         end if
-
      end if
 
 ! Write the non-zero null-histogram counts for this alpha.
@@ -782,6 +847,12 @@ program circles
 if (write_d_diff_null_histogram) then
    close(d_diff_null_hist_file)
 end if
+
+#ifdef MPI
+  if (use_d_diff_statistics) then
+     close(partial_sep_file)
+  end if
+#endif
 
 ! Gather the maxima from all MPI ranks.
 #ifdef MPI
@@ -863,6 +934,13 @@ end if
           & d_diff_max_n_joint_result, &
           & size(d_diff_max_n_joint), &
           & MPI_integer, MPI_sum, &
+          & 0, MPI_COMM_WORLD, ierr)
+
+     call MPI_reduce( &
+          & d_diff_sep_max, &
+          & d_diff_sep_max_result, &
+          & size(d_diff_sep_max), &
+          & MPI_double_precision, MPI_sum, &
           & 0, MPI_COMM_WORLD, ierr)
 
   end if
@@ -955,13 +1033,54 @@ end if
                 & d_diff_max_beta_bin_result(i), &
                 & d_diff_max_n_joint_result(i), &
                 & nside_search)
-        end do
-        close(d_full_outfile)
-     end if
+         end do
+         close(d_full_outfile)
 
+
+         ! ==================================================
+         ! Write the same search resolved into integer
+         ! centre-separation-angle bins.
+         ! ==================================================
+
+         if (use_d_diff_q_statistics) then
+
+            open(unit=d_full_outfile, &
+                 & file=trim(adjustl( &
+                 & inifilename(1:len_trim(inifilename)-4))) // &
+                 & "_q_diff_by_sep.dat")
+         else
+            open(unit=d_full_outfile, &
+                 & file=trim(adjustl( &
+                 & inifilename(1:len_trim(inifilename)-4))) // &
+                 & "_d_diff_by_sep.dat")
+         end if
+
+         write(d_full_outfile,'(A)') &
+              "# separation_deg alpha_deg statistic_max"
+
+         do sep_angle_bin = SEP_ANGLE_BIN_MIN, SEP_ANGLE_BIN_MAX
+            ! Skip bins below the requested minimum separation.
+            if (dble(sep_angle_bin) + 0.5_dp < &
+                 180.0_dp - min_separation_angle) cycle
+
+            do i = nside_search/2, 2*nside_search
+
+               if ((rad_to_deg(dble(theta_rings(i))) .lt. &
+                    & opening_angle_range%min) .or. &
+                   (rad_to_deg(dble(theta_rings(i))) .gt. &
+                    & opening_angle_range%max)) cycle
+
+               write(d_full_outfile,*) &
+                    sep_angle_bin, &
+                    rad_to_deg(dble(theta_rings(i))), &
+                    d_diff_sep_max_result(i,sep_angle_bin)
+            end do
+         end do
+         close(d_full_outfile)
+      end if
   end if
-#endif
 
+#endif
   call finalize()
 
 #ifdef MPI
@@ -1152,6 +1271,14 @@ contains
     
     if (allocated(d_diff_max_n_joint_result)) then
        deallocate(d_diff_max_n_joint_result)
+    end if
+
+    if (allocated(d_diff_sep_max)) then
+       deallocate(d_diff_sep_max)
+    end if
+    
+    if (allocated(d_diff_sep_max_result)) then
+       deallocate(d_diff_sep_max_result)
     end if
 
     if (allocated(d_diff_gaussian_mu)) then
@@ -1375,6 +1502,15 @@ contains
             nside_search/2:2*nside_search))
        allocate(d_diff_max_n_joint_result( &
             nside_search/2:2*nside_search))
+
+       allocate(d_diff_sep_max( &
+            nside_search/2:2*nside_search, &
+            SEP_ANGLE_BIN_MIN:SEP_ANGLE_BIN_MAX))
+       
+       allocate(d_diff_sep_max_result( &
+            nside_search/2:2*nside_search, &
+            SEP_ANGLE_BIN_MIN:SEP_ANGLE_BIN_MAX))
+
     end if
 
     allocate(circle_center_vectors(3,0:npix_search-1))
@@ -2123,43 +2259,29 @@ contains
     end if
     
     ! ==================================================
-    ! Find the first active opening-angle grid point.
-    !
-    ! For the current 25--45 degree search this gives
-    ! 52 consecutive theta_rings.
-    !
-    ! Table alpha_index = 0 corresponds to the first one,
-    ! alpha_index = 1 to the next one, etc.
+    ! Count opening-angle grid points used by this job.
+    ! The Gaussian lookup itself always contains the full
+    ! 52-alpha calibration table.
     ! ==================================================
-  
-    first_iopening_angle = -1
+
     n_active_alpha = 0
-  
+
     do ith = nside_search/2, 2*nside_search
-  
-       if ( &
-            rad_to_deg(dble(theta_rings(ith))) >= &
-            dble(opening_angle_range%min) .and. &
-            rad_to_deg(dble(theta_rings(ith))) <= &
-            dble(opening_angle_range%max) &
-          ) then
-  
-          if (first_iopening_angle < 0) then
-             first_iopening_angle = ith
-          end if
-  
+
+       alpha_deg = rad_to_deg(dble(theta_rings(ith)))
+
+       if (alpha_deg >= dble(opening_angle_range%min) .and. &
+           alpha_deg <= dble(opening_angle_range%max)) then
           n_active_alpha = n_active_alpha + 1
        end if
-  
+
     end do
-  
-    if (n_active_alpha /= 52) then
-       write(*,*) &
-            "ERROR: Gaussian lookup contains 52 alpha values, ", &
-            "but current search contains ", n_active_alpha
+
+    if (n_active_alpha <= 0) then
+       write(*,*) "ERROR: current search contains no active alpha values"
        stop
     end if
-  
+
     ! ==================================================
     ! Allocate lookup:
     !
@@ -2258,7 +2380,7 @@ contains
   
        ! Table has alpha_index = 0,...,51.
        if (alpha_index < 0 .or. &
-           alpha_index >= n_active_alpha) then
+           alpha_index >= 52) then
           write(*,*) &
                "ERROR: invalid alpha_index in Gaussian lookup: ", &
                alpha_index
@@ -2293,8 +2415,22 @@ contains
        ! alpha_index=1  -> next theta_ring
        ! ...
        ! alpha_index=51 -> last active theta_ring
-       iopening_lookup = &
-            first_iopening_angle + alpha_index
+       iopening_lookup = -1
+
+       do ith = nside_search/2, 2*nside_search
+          if (abs( &
+               rad_to_deg(dble(theta_rings(ith))) - alpha_deg) < &
+               1.0e-3_dp) then
+             iopening_lookup = ith
+             exit
+          end if
+       end do
+
+       if (iopening_lookup < 0) then
+          write(*,*) "ERROR: Gaussian lookup alpha not found on theta grid:"
+          write(*,*) alpha_index, alpha_deg
+          stop
+       end if
   
        d_diff_gaussian_mu( &
             iopening_lookup, n_joint) = &
@@ -2314,9 +2450,13 @@ contains
     ! every N_joint = 100,...,512.
     ! ==================================================
   
-    do ith = first_iopening_angle, &
-         first_iopening_angle + n_active_alpha - 1
-  
+    do ith = nside_search/2, 2*nside_search
+
+       alpha_deg = rad_to_deg(dble(theta_rings(ith)))
+
+       if (alpha_deg < dble(opening_angle_range%min) .or. &
+           alpha_deg > dble(opening_angle_range%max)) cycle
+
        do n = 100, nphi_ring
           if (d_diff_gaussian_sigma(ith,n) <= 0.0_dp) then
   
@@ -3247,7 +3387,7 @@ contains
        & d_diff_best_at_alpha, &
        & best_circle1_at_alpha, best_circle2_at_alpha, &
        & best_beta_at_alpha, best_n_joint_at_alpha, &
-       & found_pair_at_alpha)
+       & found_pair_at_alpha, thread_id)
   
     implicit none
   
@@ -3271,13 +3411,17 @@ contains
     integer, intent(inout) :: best_n_joint_at_alpha
   
     logical, intent(inout) :: found_pair_at_alpha
+    integer, intent(in)    :: thread_id
   
     ! Result for the current circle pair (i,j).
     integer  :: j
     integer  :: beta_try
     integer  :: n_joint_try
     integer  :: d_diff_hist_bin
+    integer  :: sep_angle_bin
     real(dp) :: d_diff_try
+    real(dp) :: sep_angle_deg
+    real(dp) :: cos_sep
   
     ! Loop only over the allowed circle centres j.
     do j = 0, opposite_number - 1
@@ -3286,7 +3430,24 @@ contains
   
        ! Avoid evaluating both (i,j) and (j,i).
        if (circle2%pixel < circle1%pixel) cycle
-  
+
+       ! Centre-to-centre separation of this pair.
+       ! Use the already cached centre vectors, so this adds almost no cost.
+       cos_sep = dble(dot_product( &
+            circle_center_vectors(:,circle1%pixel), &
+            circle_center_vectors(:,circle2%pixel)))
+       
+       cos_sep = max(-1.0_dp, min(1.0_dp, cos_sep))
+       
+       sep_angle_deg = rad_to_deg(acos(cos_sep))
+       
+       ! Map the continuous separation to the nearest integer degree.
+       ! Example: [50.5,51.5) -> 51-degree bin.
+       sep_angle_bin = nint(sep_angle_deg)
+       
+       sep_angle_bin = max(SEP_ANGLE_BIN_MIN, &
+            min(SEP_ANGLE_BIN_MAX, sep_angle_bin))
+
        ! At this fixed (i,j,alpha), maximise only over beta.
        call get_d_diff_max( &
             & circle1, circle2, d_diff_try, &
@@ -3318,9 +3479,22 @@ contains
                & n_joint_try, d_diff_hist_bin) = &
                & d_diff_null_hist_counts( &
                & n_joint_try, d_diff_hist_bin) + 1_8
-       
        end if
-  
+
+       ! Keep the largest D_diff/Q result separately for this
+       ! integer centre-separation-angle bin.
+       if (.not. d_diff_sep_found_thread( &
+            sep_angle_bin, thread_id) .or. &
+            d_diff_try > d_diff_sep_max_thread( &
+            sep_angle_bin, thread_id)) then
+       
+          d_diff_sep_max_thread( &
+               sep_angle_bin, thread_id) = d_diff_try
+       
+          d_diff_sep_found_thread( &
+               sep_angle_bin, thread_id) = .true.
+       end if
+
        ! Keep the largest result found so far at this alpha.
        if (.not. found_pair_at_alpha .or. &
            & d_diff_try > d_diff_best_at_alpha) then
